@@ -5,11 +5,12 @@ import MetaTrader5 as mt5
 order_buy = [0, 0, 0, 0, 0, 0, 0, 0, 0]
 order_sel = [0, 0, 0, 0, 0, 0, 0, 0, 0]
 
-login =   'your login'
-server =  "Your Server"
-password ='your pass'
+login =   248532703
+server =  "Exness-MT5Trial"
+password ='1q2w3e0p$Q'
 
-topics = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'BTCUSDm', 'USDJPYm', 'USOILm', 'AAPLm']
+topics = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'BTCUSDm', 'USDJPYm', 
+          'USOILm', 'AAPLm', 'ETHUSDm','BTCZARm','BTCXAUm', 'BTCCNHm','BTCJPYm',]
 
 max_spreads = {
     'XAUUSDm': 200, 
