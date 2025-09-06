@@ -6,27 +6,35 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 import pytz, requests
+
 try:
     import MetaTrader5 as mt5
     import talib
 except Exception as e:
-    raise RuntimeError("Нужны пакеты MetaTrader5 и TA-Lib.") from e
-
+    raise RuntimeError("Нужны пакеты MetaTrader5 и TA‑Lib.") from e
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("scalping_v2")
-
+log = logging.getLogger("scalping_x100")
 
 @dataclass
 class SymbolParams:
-    symbol: str
+    base: str                                  
+    resolved: Optional[str] = None              
     tf_primary: str = "M1"
-    tf_confirm: str = "M5"     
+    tf_confirm: str = "M5"
     tf_long: str = "M15"
-    entry_mode: str = "market"  
+    entry_mode: str = "market"              
     pullback_atr_mult: float = 0.35
+    spread_limit_pct: float = 0.00015
+    micro_window_sec: int = 4
+    micro_min_tps: float = 5
+    micro_max_tps: float = 45
+    micro_imb_thresh: float = 0.25
+    micro_spread_med_x: float = 1.5
+    quote_flips_max: int = 12
+    micro_tstat_thresh: float = 0.6
 
 @dataclass
 class EngineConfig:
@@ -34,14 +42,14 @@ class EngineConfig:
     password: str
     server: str
 
-    finnhub_key: str = "d2eu521r01qmrq4or590d2eu521r01qmrq4or59g"
+    finnhub_key: str = 'd2eu521r01qmrq4or590d2eu521r01qmrq4or59g'
 
     symbols: List[SymbolParams] | List[str] | str = field(default_factory=lambda: [
-        SymbolParams("XAUUSDm", "M1", "M5", "M15", "market"),
+        SymbolParams("XAUUSD", tf_primary="M1", tf_confirm="M5", tf_long="M15", entry_mode="market")
     ])
 
     tz_local: str = os.getenv("TIMEZONE", "Asia/Dushanbe")
-    active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: [(11,15),(16,21)])
+    active_sessions: List[Tuple[int, int]] = field(default_factory=lambda: [(11,15),(16,20)])
 
     conf_min: int = 85
     conf_min_low: int = 70
@@ -51,16 +59,15 @@ class EngineConfig:
     atr_rel_lo: float = 0.0006
     atr_rel_hi: float = 0.0025
 
-    spread_limit_pct: float = 0.00015
     min_body_pct_of_atr: float = 0.12
     news_blackout_min_before: int = 30
     news_blackout_min_after: int = 45
     min_bar_age_sec: int = 1
 
     fixed_volume: float = 0.01
-    max_risk_per_trade: float = 0.005
-    max_drawdown: float = 0.05
-    max_daily_loss_pct: float = 0.02
+    max_risk_per_trade: float = 0.005        
+    max_drawdown: float = 0.05               
+    max_daily_loss_pct: float = 0.02       
     max_trades_per_hour: int = 1
 
     sl_atr_mult_trend: float = 0.9
@@ -78,22 +85,14 @@ class EngineConfig:
     })
     signal_amplification: float = 1.35
 
-    decision_debounce_ms: int = 220
-    max_decision_latency_ms: int = 1200
+    decision_debounce_ms: int = 180
+    max_decision_latency_ms: int = 900
     latency_violation_limit: int = 3
-    cooldown_seconds: int = 180
-    poll_seconds_fast: int = int(os.getenv("POLL_SECONDS", "5"))
+    cooldown_seconds: int = 150
+    poll_seconds_fast: int = int(os.getenv("POLL_SECONDS", "3"))
 
-    micro_window_sec: int = int(os.getenv("MICRO_WINDOW_SEC", "4"))
-    micro_min_tps: float = float(os.getenv("MICRO_MIN_TPS", "5"))
-    micro_max_tps: float = float(os.getenv("MICRO_MAX_TPS", "45"))
-    micro_imb_thresh: float = float(os.getenv("MICRO_IMB_THRESH", "0.25"))
-    micro_spread_med_x: float = float(os.getenv("MICRO_SPREAD_MED_X", "1.5"))
-    quote_flips_max: int = int(os.getenv("QUOTE_FLIPS_MAX", "12"))
-    micro_tstat_thresh: float = float(os.getenv("MICRO_TSTAT", "0.6"))
-
-    pending_ttl_sec: int = int(os.getenv("PENDING_TTL_SEC", "15"))
-    scratch_window_s: int = int(os.getenv("SCRATCH_WINDOW_S", "6"))
+    pending_ttl_sec: int = int(os.getenv("PENDING_TTL_SEC", "12"))
+    scratch_window_s: int = int(os.getenv("SCRATCH_WINDOW_S", "5"))
     scratch_mae_r: float = float(os.getenv("SCRATCH_MAE_R", "0.25"))
 
     adaptive_enabled: bool = True
@@ -107,7 +106,6 @@ TF_MAP = {
     "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
     "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1
 }
-TF_SEC = {"M1":60, "M5":300, "M15":900, "M30":1800, "H1":3600}
 
 def safe_last(x: np.ndarray, default: float = 0.0) -> float:
     try:
@@ -126,19 +124,23 @@ class NewsGuard:
     def stop(self): self._stop = True
 
     def _run(self):
-        if not self.cfg.finnhub_key: return
-        sess = requests.Session(); sess.headers.update({"User-Agent":"scalping-v2/1.0"})
+        if not self.cfg.finnhub_key:
+            return
+        sess = requests.Session(); sess.headers.update({"User-Agent":"scalping-x100/1.0"})
         while not self._stop:
             try:
                 utc_now = datetime.now(timezone.utc)
                 start = (utc_now - timedelta(hours=8)).date()
                 finish = (utc_now + timedelta(hours=8)).date()
-                url = f"https://finnhub.io/api/v1/calendar/economic?from={start}&to={finish}&token={self.cfg.finnhub_key}"
+                url = (
+                    f"https://finnhub.io/api/v1/calendar/economic?from={start}&to={finish}&token={self.cfg.finnhub_key}"
+                )
                 r = sess.get(url, timeout=3)
                 self.flag = False
                 if r.ok:
                     for ev in (r.json() or {}).get("economicCalendar", []):
-                        if str(ev.get("impact", "")).lower() not in ("high","medium"): continue
+                        if str(ev.get("impact", "")).lower() not in ("high","medium"):
+                            continue
                         dt = ev.get("time") or ev.get("date")
                         if not dt: continue
                         try:
@@ -165,8 +167,10 @@ class Worker:
         self._filled_at: Dict[int,float] = {}
         self._addons_done: Dict[int,int] = {}
         self._current_drawdown = 0.0
-        if not mt5.symbol_select(self.sp.symbol, True):
-            log.warning("symbol_select failed: %s", self.sp.symbol)
+        self._rates_cache: Dict[str, Tuple[pd.DataFrame, float]] = {}
+        self._cache_ttl_sec = {"M1":0.35, "M5":0.5, "M15":0.75, "M30":1.0, "H1":1.5}
+        if self.sp.resolved and not mt5.symbol_select(self.sp.resolved, True):
+            log.warning("symbol_select failed: %s", self.sp.resolved)
 
     def _now_local(self): return datetime.now(self.tz)
     def _hour_key(self):  return self._now_local().strftime("%Y-%m-%d %H:00")
@@ -176,20 +180,29 @@ class Worker:
         return any(s<=h<e for s,e in self.cfg.active_sessions)
 
     def _fetch_rates(self, tf:str, count:int=300)->Optional[pd.DataFrame]:
+        sym = self.sp.resolved or self.sp.base
         tfc = TF_MAP.get(tf)
         if tfc is None: return None
+        now = time.time()
+        ttl = self._cache_ttl_sec.get(tf, 0.6)
+        if tf in self._rates_cache:
+            df, ts = self._rates_cache[tf]
+            if now - ts < ttl:
+                return df
         for _ in range(2):
-            rr=mt5.copy_rates_from_pos(self.sp.symbol, tfc, 0, count)
+            rr=mt5.copy_rates_from_pos(sym, tfc, 0, count)
             if rr is not None and len(rr)>=60:
                 df=pd.DataFrame(rr)
                 df["time"]=pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert(self.tz)
+                self._rates_cache[tf] = (df, now)
                 return df
-            time.sleep(0.02)
+            time.sleep(0.01)
         return None
 
     def _fetch_book(self)->Optional[Dict[str,Any]]:
         try:
-            book=mt5.market_book_get(self.sp.symbol)
+            sym = self.sp.resolved or self.sp.base
+            book=mt5.market_book_get(sym)
             if book is None: return None
             bids,asks=[],[]
             for lv in book:
@@ -200,7 +213,7 @@ class Worker:
         except Exception: return None
 
     def _spread_pct(self)->float:
-        info=mt5.symbol_info(self.sp.symbol)
+        info=mt5.symbol_info(self.sp.resolved or self.sp.base)
         if not info or None in (info.spread, info.point, info.bid, info.ask): return 1e-4
         spr=info.spread*info.point; mid=(info.bid+info.ask)/2.0
         return spr/max(1e-9,mid)
@@ -259,7 +272,7 @@ class Worker:
 
     def _regime(self, ind_long:Dict[str,Any])->str:
         if not ind_long: return "trend"
-        return "trend" if (ind_long.get("adx",0.0)>=18.0 or abs(ind_long.get("slope_deg",0.0))>=1.5) else "range"
+        return "trend" if (ind_long.get("adx",0.0)>=self.cfg.adx_trend_lo or abs(ind_long.get("slope_deg",0.0))>=1.5) else "range"
 
     def _adaptive_params(self, ind_p:Dict[str,Any], ind_l:Dict[str,Any])->Dict[str,Any]:
         if not self.cfg.adaptive_enabled:
@@ -268,7 +281,7 @@ class Worker:
                     "tp_mult": (self.cfg.tp_atr_mult_trend if self._regime(ind_l)=="trend" else self.cfg.tp_atr_mult_range),
                     "trail_mult": self.cfg.trail_atr_mult,
                     "w_mul": {"trend":1.0,"momentum":1.0,"meanrev":1.0,"structure":1.0,"volume":1.0}}
-        adx=ind_l.get("adx",18.0)
+        adx=ind_l.get("adx",self.cfg.adx_trend_lo)
         atr_rel = ind_p.get("atr",0.0)/max(1e-9, ind_p.get("close",1.0))
         regime=self._regime(ind_l)
         conf= self.cfg.conf_min
@@ -326,7 +339,7 @@ class Worker:
         rev += 0.5 if c>ind["psar"] else -0.5
         mr += rev
         (w_buy if mr>0 else w_sell)["meanrev"]=abs(mr)*wmul.get("meanrev",1.0)
-        s=0.0; mid=0.5*(ind["don_high"]+ind["don_low"])
+        s=0.0; mid=0.5*(ind["don_high"]+ind["don_low"]).__float__()
         if c>=ind["don_high"]: s=2.0
         elif c<=ind["don_low"]: s=-2.0
         elif c>mid: s=0.5
@@ -350,32 +363,33 @@ class Worker:
 
     def _micro_ok(self)->Tuple[bool,str,float]:
         try:
-            end=int(time.time()); start=end-self.cfg.micro_window_sec
-            ticks=mt5.copy_ticks_range(self.sp.symbol, start*1000, end*1000, mt5.COPY_TICKS_INFO)
-            if ticks is None or len(ticks) < max(4, self.cfg.micro_window_sec*2):
+            sym = self.sp.resolved or self.sp.base
+            end=int(time.time()); start=end-self.sp.micro_window_sec
+            ticks=mt5.copy_ticks_range(sym, start*1000, end*1000, mt5.COPY_TICKS_INFO)
+            if ticks is None or len(ticks) < max(4, self.sp.micro_window_sec*2):
                 return True,"",0.0
             b=np.array([t['bid'] for t in ticks if t['bid']>0.0], dtype=float)
             a=np.array([t['ask'] for t in ticks if t['ask']>0.0], dtype=float)
             if len(b)==0 or len(a)==0: return False,"no_quotes",0.0
-            tps=len(ticks)/max(1.0, self.cfg.micro_window_sec)
-            if tps<self.cfg.micro_min_tps: return False,"thin_tape",0.0
-            if tps>self.cfg.micro_max_tps: return False,"storm_tape",0.0
+            tps=len(ticks)/max(1.0, self.sp.micro_window_sec)
+            if tps<self.sp.micro_min_tps: return False,"thin_tape",0.0
+            if tps>self.sp.micro_max_tps: return False,"storm_tape",0.0
             spr=a-b; med=float(np.nanmedian(spr)); cur=float(spr[-1])
-            if cur> self.cfg.micro_spread_med_x*max(1e-9,med): return False,"spread_spike",0.0
+            if cur> self.sp.micro_spread_med_x*max(1e-9,med): return False,"spread_spike",0.0
             mid=(a+b)/2.0; dm=np.diff(mid)
             up=int((dm>0).sum()); dn=int((dm<0).sum()); tot=max(1,up+dn)
             imb=abs(up-dn)/tot
-            if imb < self.cfg.micro_imb_thresh: return False,"no_aggressor",0.0
+            if imb < self.sp.micro_imb_thresh: return False,"no_aggressor",0.0
             flips=0; last=None
             for i in range(1,len(a)):
                 side = 1 if a[i]-a[i-1] > b[i]-b[i-1] else -1
                 if last is not None and side!=last: flips+=1
                 last=side
-            if flips>self.cfg.quote_flips_max: return False,"quote_flips",0.0
+            if flips>self.sp.quote_flips_max: return False,"quote_flips",0.0
             rets=np.diff(np.log(mid+1e-9))
             mu=np.mean(rets); sd=np.std(rets, ddof=1) or 1e-9; n=len(rets)
             tstat= float(abs(mu)/(sd/np.sqrt(max(1,n))))
-            if tstat < self.cfg.micro_tstat_thresh: return False,"tstat_weak",tstat
+            if tstat < self.sp.micro_tstat_thresh: return False,"tstat_weak",tstat
             return True,"",tstat
         except Exception:
             return True,"",0.0
@@ -390,10 +404,10 @@ class Worker:
     def _calc_volume(self, tick, sl_dist:float)->float:
         vol=self.cfg.fixed_volume
         try:
-            info=mt5.symbol_info(self.sp.symbol)
+            info=mt5.symbol_info(self.sp.resolved or self.sp.base)
             acct=mt5.account_info()
             if info and acct and sl_dist>0:
-                balance=float(acct.balance); price=(tick.ask+tick.bid)/2.0
+                balance=float(acct.balance)
                 contract=float(getattr(info, "trade_contract_size", 100.0))
                 tick_size=float(getattr(info, "trade_tick_size", info.point))
                 tick_value=float(getattr(info, "trade_tick_value", 0.0)) or (contract * tick_size)
@@ -409,15 +423,14 @@ class Worker:
         t0 = time.time()
         reasons: List[str] = []
 
-        dfp = self._fetch_rates(self.sp.tf_primary, 200)
+        dfp = self._fetch_rates(self.sp.tf_primary, 220)
         if dfp is None or dfp.empty:
             return {
-                "symbol": self.sp.symbol, "signal": "Neutral", "confidence": 0,
+                "symbol": self.sp.resolved or self.sp.base, "signal": "Neutral", "confidence": 0,
                 "regime": None, "reasons": ["no_rates_primary"],
                 "spread_bps": None, "latency_ms": (time.time() - t0) * 1000.0,
                 "timestamp": self._now_local().isoformat()
             }
-
         dfc = self._fetch_rates(self.sp.tf_confirm, 200)
         if dfc is None or dfc.empty:
             dfc = dfp
@@ -432,16 +445,16 @@ class Worker:
 
         if self._current_drawdown >= self.cfg.max_drawdown: reasons.append("max_drawdown")
         if self.news.flag: reasons.append("news_blackout")
-        if spread > self.cfg.spread_limit_pct: reasons.append("spread")
+        if spread > self.sp.spread_limit_pct: reasons.append("spread")
         if not self._in_active_session(): reasons.append("session")
-        if ingest_ms > 8000: reasons.append("ingest_slow")
+        if ingest_ms > 6000: reasons.append("ingest_slow")
         if not self._trade_quota_ok(): reasons.append("quota")
         if last_age < self.cfg.min_bar_age_sec: reasons.append("bar_age")
         ok_micro, why_micro, tstat = self._micro_ok()
         if not ok_micro: reasons.append(f"micro:{why_micro}")
         if reasons:
             return {
-                "symbol": self.sp.symbol, "signal": "Neutral", "confidence": 0,
+                "symbol": self.sp.resolved or self.sp.base, "signal": "Neutral", "confidence": 0,
                 "regime": None, "reasons": reasons, "spread_bps": spread * 10000,
                 "latency_ms": (time.time() - t0) * 1000.0,
                 "timestamp": self._now_local().isoformat()
@@ -452,7 +465,7 @@ class Worker:
         indl = self._indicators(dfl, is_long=True, shift=1) if isinstance(dfl, pd.DataFrame) and not dfl.empty else None
         if not indp:
             return {
-                "symbol": self.sp.symbol, "signal": "Neutral", "confidence": 0,
+                "symbol": self.sp.resolved or self.sp.base, "signal": "Neutral", "confidence": 0,
                 "regime": None, "reasons": ["no_indicators"],
                 "spread_bps": spread * 10000, "latency_ms": (time.time() - t0) * 1000.0,
                 "timestamp": self._now_local().isoformat()
@@ -460,15 +473,15 @@ class Worker:
         if self.cfg.use_squeeze_filter and indp.get("squeeze_on", False):
             reasons.append("squeeze_wait")
             return {
-                "symbol": self.sp.symbol, "signal": "Neutral", "confidence": 0,
+                "symbol": self.sp.resolved or self.sp.base, "signal": "Neutral", "confidence": 0,
                 "regime": None, "reasons": reasons, "spread_bps": spread * 10000,
                 "latency_ms": (time.time() - t0) * 1000.0,
                 "timestamp": self._now_local().isoformat()
             }
 
         if indl:
-            trend_ok_buy  = (indl.get("adx", 0) >= 20 and indp["close"] > indl.get("ema50", indp["close"] * 0.999))
-            trend_ok_sell = (indl.get("adx", 0) >= 20 and indp["close"] < indl.get("ema50", indp["close"] * 1.001))
+            trend_ok_buy  = (indl.get("adx", 0) >= self.cfg.adx_trend_lo and indp["close"] > indl.get("ema50", indp["close"] * 0.999))
+            trend_ok_sell = (indl.get("adx", 0) >= self.cfg.adx_trend_lo and indp["close"] < indl.get("ema50", indp["close"] * 1.001))
         else:
             trend_ok_buy = trend_ok_sell = True
 
@@ -489,7 +502,7 @@ class Worker:
             if (net > 0 and cnet > 0) or (net < 0 and cnet < 0):
                 conf = min(100, conf + 12)
 
-        if tstat >= self.cfg.micro_tstat_thresh:
+        if tstat >= self.sp.micro_tstat_thresh:
             conf = min(100, int(conf * (1.0 + min(0.10, 0.02 * tstat))))
         if indp.get("atr", 0) > 0 and (indp["atr"]/max(1e-9, indp["close"])) * 100.0 > 0.1:
             conf = int(conf * 1.03)
@@ -499,7 +512,6 @@ class Worker:
 
         signal = "Neutral"
         blocked_by_htf = False
-        below_conf = False
 
         if conf >= adapt["conf_min"]:
             if net_norm > 0.05 and trend_ok_buy:
@@ -509,21 +521,19 @@ class Worker:
             else:
                 blocked_by_htf = True
         else:
-            below_conf = True
             reasons.append("conf_below_min")
 
         signal, conf = self._apply_filters(signal, conf, indp)
 
-        if signal == "Neutral":
-            if blocked_by_htf:
-                reasons.append("htf_trend_block")
-                conf = min(conf, max(0, adapt["conf_min"] - 1))
-       
+        if signal == "Neutral" and blocked_by_htf:
+            reasons.append("htf_trend_block")
+            conf = min(conf, max(0, adapt["conf_min"] - 1))
+
         now_ms = time.time() * 1000.0
         if (now_ms - self._last_decision_ms) < self.cfg.decision_debounce_ms:
             reasons.append("debounce")
             return {
-                "symbol": self.sp.symbol, "signal": "Neutral", "confidence": 0,
+                "symbol": self.sp.resolved or self.sp.base, "signal": "Neutral", "confidence": 0,
                 "regime": regime, "reasons": reasons,
                 "spread_bps": spread*10000, "latency_ms": (time.time()-t0)*1000.0,
                 "timestamp": self._now_local().isoformat()
@@ -531,7 +541,7 @@ class Worker:
         if signal == self._last_signal and abs(net_norm - self._last_net_norm) < 0.03:
             reasons.append("stable")
             return {
-                "symbol": self.sp.symbol, "signal": "Neutral", "confidence": 0,
+                "symbol": self.sp.resolved or self.sp.base, "signal": "Neutral", "confidence": 0,
                 "regime": regime, "reasons": reasons,
                 "spread_bps": spread*10000, "latency_ms": (time.time()-t0)*1000.0,
                 "timestamp": self._now_local().isoformat()
@@ -546,8 +556,8 @@ class Worker:
             self._execute(signal, conf, indp, adapt)
 
         res = {
-            "symbol": self.sp.symbol, "signal": signal, "confidence": int(conf),
-            "regime": regime, "reasons": reasons,  
+            "symbol": self.sp.resolved or self.sp.base, "signal": signal, "confidence": int(conf),
+            "regime": regime, "reasons": reasons,
             "spread_bps": spread * 10000,
             "latency_ms": comp_ms,
             "timestamp": self._now_local().isoformat()
@@ -557,7 +567,8 @@ class Worker:
 
     def _execute(self, signal:str, confidence:int, ind:Dict[str,Any], adapt:Dict[str,Any])->bool:
         try:
-            tick=mt5.symbol_info_tick(self.sp.symbol)
+            sym = self.sp.resolved or self.sp.base
+            tick=mt5.symbol_info_tick(sym)
             if not tick: return False
             atr=max(ind.get("atr",0.0),1e-9)
             sl_mult, tp_mult = adapt["sl_mult"], adapt["tp_mult"]
@@ -566,8 +577,8 @@ class Worker:
             sl_dist, tp_dist = atr*sl_mult, atr*tp_mult
             vol=self._calc_volume(tick, sl_dist)
             req={"action": mt5.TRADE_ACTION_DEAL if self.sp.entry_mode=="market" else mt5.TRADE_ACTION_PENDING,
-                 "symbol": self.sp.symbol, "volume": float(vol),
-                 "deviation":10,"magic":20250826,"comment":f"ADAPT-{signal}-{confidence}%",
+                 "symbol": sym, "volume": float(vol),
+                 "deviation":10,"magic":20250826,"comment":f"X100-{signal}-{confidence}%",
                  "type_time": mt5.ORDER_TIME_GTC,
                  "type_filling": mt5.ORDER_FILLING_IOC if self.sp.entry_mode=="market" else mt5.ORDER_FILLING_RETURN}
             if signal=="Buy":
@@ -579,14 +590,14 @@ class Worker:
                 req.update({"type": mt5.ORDER_TYPE_SELL if self.sp.entry_mode=="market" else mt5.ORDER_TYPE_SELL_LIMIT,
                             "price": float(entry), "sl": float(entry + sl_dist), "tp": float(entry - tp_dist)})
             t0=time.time(); res=mt5.order_send(req); rtt=(time.time()-t0)*1000.0
-            log.info("ORDER %s | %s vol=%.2f rtt=%d ret=%s", self.sp.symbol, req.get("type"), float(req["volume"]), int(rtt), getattr(res,"retcode",None))
+            log.info("ORDER %s | %s vol=%.2f rtt=%d ret=%s", sym, req.get("type"), float(req["volume"]), int(rtt), getattr(res,"retcode",None))
             code=getattr(res,"retcode",None); ticket=getattr(res,"order",None)
             if not res or code not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
                 return False
             if req["action"]==mt5.TRADE_ACTION_PENDING and ticket:
                 self._pending_created[int(ticket)]=time.time()
             else:
-                for p in (mt5.positions_get(symbol=self.sp.symbol) or []):
+                for p in (mt5.positions_get(symbol=sym) or []):
                     self._filled_at[int(p.ticket)] = time.time()
                     self._addons_done[int(p.ticket)] = 0
             acct=mt5.account_info()
@@ -595,18 +606,19 @@ class Worker:
                 except Exception: pass
             return True
         except Exception as e:
-            log.error("execute error %s: %s", self.sp.symbol, e); return False
+            log.error("execute error %s: %s", self.sp.resolved or self.sp.base, e); return False
 
     def manage_positions(self):
         try:
-            now=time.time(); tick=mt5.symbol_info_tick(self.sp.symbol)
-            for o in (mt5.orders_get(symbol=self.sp.symbol) or []):
+            sym = self.sp.resolved or self.sp.base
+            now=time.time(); tick=mt5.symbol_info_tick(sym)
+            for o in (mt5.orders_get(symbol=sym) or []):
                 c=self._pending_created.get(o.ticket)
                 if c and now-c>self.cfg.pending_ttl_sec:
                     mt5.order_delete(o.ticket)
                     self._pending_created.pop(o.ticket,None)
-                    log.info("CANCEL TTL %s order=%s", self.sp.symbol, o.ticket)
-            positions=mt5.positions_get(symbol=self.sp.symbol)
+                    log.info("CANCEL TTL %s order=%s", sym, o.ticket)
+            positions=mt5.positions_get(symbol=sym)
             if not positions or not tick: return
             dfp=self._fetch_rates(self.sp.tf_primary, 160)
             indp=self._indicators(dfp) if dfp is not None else None
@@ -647,7 +659,7 @@ class Worker:
         atr=talib.ATR(df["high"].values.astype(np.float64),
                       df["low"].values.astype(np.float64),
                       df["close"].values.astype(np.float64),14)
-        return float(atr[-2]) if np.isfinite(atr[-2]) else 0.0  
+        return float(atr[-2]) if np.isfinite(atr[-2]) else 0.0
 
     def _modify_sl(self, ticket:int, new_sl:float, tp:float):
         try:
@@ -685,7 +697,7 @@ class Worker:
                  "deviation":10, "magic":20250826, "comment":comment,
                  "type_time": mt5.ORDER_TIME_GTC, "type_filling": mt5.ORDER_FILLING_IOC}
             rr=mt5.order_send(req)
-            log.info("%s CLOSE %s ret=%s", self.sp.symbol, comment, getattr(rr,"retcode",None))
+            log.info("%s CLOSE %s ret=%s", p.symbol, comment, getattr(rr,"retcode",None))
         except Exception as e: log.debug("close_full err %s", e)
 
     def _log_csv(self, res: Dict[str,Any]):
@@ -706,12 +718,29 @@ class Engine:
     def __init__(self, cfg:EngineConfig):
         self.cfg=cfg; self.tz=pytz.timezone(cfg.tz_local); self.news=NewsGuard(cfg)
         self._workers: List[Worker] = []
+        self._daily_pnl_start_equity: Optional[float] = None
+
+    def _resolve_symbol_name(self, base:str)->str:
+        candidates=[base, base+"m", base+".e", base+"-RAW", base+"-raw"]
+        try:
+            all_syms = mt5.symbols_get()
+            names = {s.name for s in (all_syms or [])}
+            for c in candidates:
+                if c in names: return c
+            for s in (all_syms or []):
+                nm=s.name.upper(); b=base.upper()
+                if b in nm: return s.name
+        except Exception:
+            pass
+        return base
 
     def _init_mt5(self)->bool:
         for _ in range(6):
             if mt5.initialize(login=self.cfg.login, server=self.cfg.server, password=self.cfg.password):
                 term=mt5.terminal_info(); acc=mt5.account_info()
                 log.info("MT5 ready | build=%s | login=%s", getattr(term,'build',None), getattr(acc,'login',None))
+                if self._daily_pnl_start_equity is None and acc:
+                    self._daily_pnl_start_equity = float(acc.equity)
                 return True
             time.sleep(1.0)
         log.error("MT5 init failed"); return False
@@ -724,15 +753,42 @@ class Engine:
             self._init_mt5()
 
     def _normalize_symbols(self, symbols)->List[SymbolParams]:
-        if isinstance(symbols, list) and symbols and isinstance(symbols[0], SymbolParams): return symbols
-        if isinstance(symbols, str): syms=[x.strip() for x in symbols.split(',') if x.strip()]
-        elif isinstance(symbols, list): syms=[str(x).strip() for x in symbols if str(x).strip()]
-        else: syms=["XAUUSDm"]
-        def_tf={"XAUUSDm":"M1","BTCUSDm":"M5","EURUSDm":"M1"}
-        entry=os.getenv("ENTRY_MODE","market")
-        def next_tf(tf):
-            return {"M1":"M5","M5":"M15","M15":"M30","M30":"H1"}.get(tf, "M15")
-        return [SymbolParams(s, tf_primary=def_tf.get(s,"M5"), tf_confirm=next_tf(def_tf.get(s,"M5")), tf_long="M15", entry_mode=entry) for s in syms]
+        if isinstance(symbols, list) and symbols and isinstance(symbols[0], SymbolParams):
+            syms = symbols
+        else:
+            if isinstance(symbols, str): bases=[x.strip() for x in symbols.split(',') if x.strip()]
+            elif isinstance(symbols, list): bases=[str(x).strip() for x in symbols if str(x).strip()]
+            else: bases=["XAUUSD","BTCUSD","EURUSD"]
+            syms=[]
+            for b in bases:
+                if b.upper()=="BTCUSD":
+                    sp=SymbolParams(b, tf_primary="M5", tf_confirm="M15", tf_long="M15")
+                    sp.micro_min_tps=3; sp.micro_max_tps=80; sp.quote_flips_max=16; sp.micro_tstat_thresh=0.5
+                    sp.spread_limit_pct=0.0008
+                elif b.upper()=="XAUUSD":
+                    sp=SymbolParams(b, tf_primary="M1", tf_confirm="M5", tf_long="M15")
+                    sp.spread_limit_pct=0.00018
+                else: 
+                    sp=SymbolParams(b, tf_primary="M1", tf_confirm="M5", tf_long="M15")
+                    sp.spread_limit_pct=0.00012
+                syms.append(sp)
+        for sp in syms:
+            sp.resolved = self._resolve_symbol_name(sp.base)
+            try:
+                mt5.symbol_select(sp.resolved, True)
+            except Exception:
+                pass
+        return syms
+
+    def _daily_loss_guard(self)->bool:
+        try:
+            acc=mt5.account_info()
+            if not acc or self._daily_pnl_start_equity is None:
+                return False
+            drop=(self._daily_pnl_start_equity - float(acc.equity))/max(1.0, self._daily_pnl_start_equity)
+            return drop >= self.cfg.max_daily_loss_pct
+        except Exception:
+            return False
 
     def start(self):
         if not self._init_mt5(): raise SystemExit(1)
@@ -741,17 +797,27 @@ class Engine:
         self._workers=[Worker(self.cfg, sp, self.news) for sp in syms]
 
     def get_signal(self, symbol:Optional[str]=None, execute:bool=False)->Dict[str,Any]:
+        
         if not self._workers: self.start()
+        if self._daily_loss_guard():
+            return {"symbol": symbol or "*", "signal":"Neutral", "confidence":0,
+                    "regime":None, "reasons":["daily_loss_guard"],
+                    "spread_bps":None, "latency_ms":0.0, "timestamp": datetime.now(pytz.timezone(self.cfg.tz_local)).isoformat()}
         if symbol is None:
             if len(self._workers)==1: return self._workers[0].get_signal(execute=execute)
             raise ValueError("Specify symbol when multiple workers are active")
-        w=next((w for w in self._workers if w.sp.symbol==symbol.strip()), None)
+        w=next((w for w in self._workers if (w.sp.resolved==symbol.strip() or w.sp.base==symbol.strip())), None)
         if not w: raise ValueError(f"Unknown symbol {symbol}")
         return w.get_signal(execute=execute)
 
     def get_signals(self, execute:bool=False)->Dict[str,Dict[str,Any]]:
         if not self._workers: self.start()
-        return {w.sp.symbol: w.get_signal(execute=execute) for w in self._workers}
+        if self._daily_loss_guard():
+            return {w.sp.resolved or w.sp.base: {"symbol": w.sp.resolved or w.sp.base, "signal":"Neutral", "confidence":0,
+                                                "regime":None, "reasons":["daily_loss_guard"],
+                                                "spread_bps":None, "latency_ms":0.0, "timestamp": datetime.now(pytz.timezone(self.cfg.tz_local)).isoformat()}
+                    for w in self._workers}
+        return {w.sp.resolved or w.sp.base: w.get_signal(execute=execute) for w in self._workers}
 
     def loop(self, execute:bool=False):
         poll=int(os.getenv("POLL_SECONDS", str(self.cfg.poll_seconds_fast)))
@@ -759,12 +825,13 @@ class Engine:
             t0=time.time(); self._ensure_alive()
             for w in self._workers:
                 try:
-                    w.manage_positions()   
+                    w.manage_positions()
                     res=w.get_signal(execute=execute)
                     print(json.dumps(res, ensure_ascii=False))
                 except Exception as e:
-                    log.error("worker %s error: %s", w.sp.symbol, e)
+                    log.error("worker %s error: %s", w.sp.resolved or w.sp.base, e)
             time.sleep(max(0.5, poll - (time.time()-t0)))
+
 
 def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool):
     if not enable: return
@@ -781,19 +848,23 @@ def apply_high_accuracy_mode(cfg: EngineConfig, enable: bool):
     cfg.pyramid_enabled = False
 
 if __name__=="__main__":
-    cfg=EngineConfig(
-        login=int(os.getenv("MT5_LOGIN","248532703")),
-        password=os.getenv("MT5_PASSWORD","1q2w3e0p$Q"),
-        server=os.getenv("MT5_SERVER","Exness-MT5Trial"),
-        finnhub_key=os.getenv("FINNHUB_KEY","d2eu521r01qmrq4or590d2eu521r01qmrq4or59g"),
-        symbols=os.getenv("SYMBOLS","BTCUSDm"),
-    )
-    apply_high_accuracy_mode(cfg, bool(int(os.getenv("HIGH_ACCURACY","0"))))
-    engine=Engine(cfg)
-    engine.start()
-    symbol=os.getenv("SYMBOL","BTCUSDm")
-    if bool(int(os.getenv("LOOP","0"))):    
-        engine.loop(execute=bool(int(os.getenv("EXECUTE","0"))))
-    else:
-        res = engine.get_signal(symbol, execute=bool(int(os.getenv("EXECUTE","0"))))
-        print(json.dumps(res, ensure_ascii=False, indent=2, ))
+    while True:
+        cfg = EngineConfig(
+            login=248532703,
+            password="1q2w3e0p$Q",
+            server="Exness-MT5Trial",
+            finnhub_key="",
+            symbols=["XAUUSDm"])
+
+        apply_high_accuracy_mode(cfg, True)
+        engine = Engine(cfg)
+        engine.start()
+        if bool(int(os.getenv("LOOP","0"))):
+            engine.loop(execute=True)
+        else:
+            res = engine.get_signals(execute=True)
+            signal = res["XAUUSDm"]["signal"]
+            print("Signal for XAUUSDm:", signal)
+        
+        time.sleep(2)
+

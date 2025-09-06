@@ -1,375 +1,416 @@
 import MetaTrader5 as mt5
-import os, math, time
+import math, time
+from dataclasses import dataclass
+from typing import Optional, Literal, Tuple
 from datetime import datetime
-import pytz
 
-LOGIN    = int(os.getenv("MT5_LOGIN", '248532703'))
-PASSWORD = os.getenv("MT5_PASSWORD", "1q2w3e0p$Q")    
-SERVER   = os.getenv("MT5_SERVER", 'Exness-MT5Trial')
+LOGIN    = 248532703
+PASSWORD = "1q2w3e0p$Q"
+SERVER   = "Exness-MT5Trial"
 
 
-_INIT_TRIES = (0.5, 1.0, 2.0, 3.0) 
-_CONNECTED_ONCE = False          
 
-def _is_connected_ok() -> bool:
-    try:
-        ti = mt5.terminal_info()
-        acc = mt5.account_info()
-        return bool(ti and acc and acc.login == LOGIN)
-    except:
-        return False
+def check_clos_orders():
+    login = 248532703
+    password = "1q2w3e0p$Q"
+    server = "Exness-MT5Trial"
 
-def initialize_mt5() -> bool:
-    global _CONNECTED_ONCE
-    if _is_connected_ok():
-        if not _CONNECTED_ONCE:
-            acc = mt5.account_info()
-            print(f"✅ MT5 connected | balance={acc.balance} equity={acc.equity} margin_free={acc.margin_free}")
-            _CONNECTED_ONCE = True
-        return True
+    if not mt5.initialize():
+        raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
 
-    try: mt5.shutdown()
-    except: pass
+    if not mt5.login(login=login, password=password, server=server):
+        raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
 
-    ok = False
-    for wait in _INIT_TRIES:
-        ok = mt5.initialize(login=LOGIN, server=SERVER, password=PASSWORD)
-        if ok and _is_connected_ok():
-            acc = mt5.account_info()
-            print(f"✅ MT5 connected | balance={acc.balance} equity={acc.equity} margin_free={acc.margin_free}")
-            _CONNECTED_ONCE = True
-            return True
-        code, msg = mt5.last_error()
-        print(f"❌ MT5 initialize/login failed: {code} {msg}; retry in {wait}s")
-        time.sleep(wait)
-        try: mt5.shutdown()
-        except: pass
-    return False
+    while True:
+        pos_total = mt5.positions_total()
+        ord_total = mt5.orders_total()
+        if pos_total == 0 and ord_total == 0:
+            break
+        time.sleep(1)
 
-def shutdown_mt5():
-    try:
-        mt5.shutdown()
-        print("✅ MT5 disconnected")
-    except Exception as e:
-        print(f"❌ Error during MT5 shutdown: {e}")
+def _round_to_step(value: float, step: float, max_digits: int = 8) -> float:
+    if step <= 0: return round(float(value), max_digits)
+    return round(math.floor((value + 1e-12) / step) * step, max_digits)
 
-def check_autotrading_enabled() -> bool:
-    try:
-        ti = mt5.terminal_info()
-        if not ti:
-            print("⚠️ terminal_info() None (идома медиҳем).")
-            return False
-        if not ti.trade_allowed:
-            print("⚠️ Autotrading хомӯш аст дар терминал — идома медиҳем (fallback).")
-            return False
-        return True
-    except Exception as e:
-        print(f"⚠️ Ҳангоми тафтиши автотрейдинг: {e} (идома медиҳем)")
-        return False
-
-def _round_to_step(value, step, min_v=None, max_v=None):
-    if not step or step <= 0: return float(value)
-    k = math.floor(float(value) / step)
-    v = k * step
-    if min_v is not None and v < min_v: v = min_v
-    if max_v is not None and v > max_v: v = max_v
-    s = f"{step:.10f}".rstrip('0').rstrip('.')
-    decimals = len(s.split('.')[-1]) if '.' in s else 0
-    return float(f"{v:.{decimals}f}")
-
-def normalize_price(symbol, price):
-    if price is None: return None
+def _snap_price(symbol: str, price: float) -> float:
     info = mt5.symbol_info(symbol)
-    return float(round(float(price), info.digits)) if info else float(price)
+    if not info: return float(price)
+    tick = info.trade_tick_size or info.point
+    p = _round_to_step(price, tick, info.digits)
+    return float(round(p, info.digits))
 
-def ensure_symbol_ready(symbol) -> bool:
-    if not mt5.symbol_select(symbol, True):
-        print(f"❌ symbol_select({symbol}) failed: {mt5.last_error()}")
-        return False
+def _lot_sanitize(symbol: str, lot: float) -> float:
     info = mt5.symbol_info(symbol)
-    if info is None:
-        print("❌ symbol_info() returned None")
-        return False
-    if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
-        print("❌ Symbol trade disabled by broker")
-        return False
-    return True
+    if not info: return float(lot)
+    lot = max(info.volume_min, min(info.volume_max, float(lot)))
+    step = info.volume_step or 0.01
+    return float(round(_round_to_step(lot, step, 3), 3))
 
-def get_tick_retry(symbol, tries=6, delay=0.25):
-    for _ in range(tries):
-        t = mt5.symbol_info_tick(symbol)
-        if t and t.bid and t.ask and t.bid > 0 and t.ask > 0:
-            return t
-        time.sleep(delay)
+def _min_stops_points(symbol: str) -> int:
+    info = mt5.symbol_info(symbol)
+    if not info: return 0
+    stops = int(getattr(info, "stops_level", 0) or 0)
+    freeze = int(getattr(info, "freeze_level", 0) or 0)
+    return max(stops, freeze, 0)
+
+def _allowed_fillings(symbol: str):
+    info = mt5.symbol_info(symbol)
+    if not info: return []
+    fm = int(getattr(info, "filling_mode", 0) or 0)
+    allowed = []
+    if fm & mt5.ORDER_FILLING_IOC:    allowed.append(mt5.ORDER_FILLING_IOC)
+    if fm & mt5.ORDER_FILLING_FOK:    allowed.append(mt5.ORDER_FILLING_FOK)
+    if fm & mt5.ORDER_FILLING_RETURN: allowed.append(mt5.ORDER_FILLING_RETURN)
+    return allowed
+
+def _send_with_fillings(symbol: str, request: dict):
+    last = None
+    tried = []
+    for fm in _allowed_fillings(symbol):
+        r = dict(request); r["type_filling"] = fm
+        res = mt5.order_send(r); last = res
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            return res
+        tried.append(("fill", fm, getattr(res, "retcode", None), getattr(res, "comment", None)))
+    # Фолбэк: бе type_filling
+    r2 = dict(request); r2.pop("type_filling", None)
+    res2 = mt5.order_send(r2); last = res2
+    if not (res2 and res2.retcode == mt5.TRADE_RETCODE_DONE):
+        print("❌ order_send failed. Tried:", tried,
+              "fallback_retcode:", getattr(res2, "retcode", None),
+              "comment:", getattr(res2, "comment", None))
+    return last
+
+# ==== USD→POINTS ва тарафи нарх ====
+def _usd_to_points(symbol: str, usd_amount: float, lot: float) -> Optional[float]:
+    info = mt5.symbol_info(symbol)
+    if not info or not info.trade_tick_value or not info.trade_tick_size or not info.point:
+        return None
+    vpp_1lot = (info.trade_tick_value / info.trade_tick_size) * info.point  # USD per point per 1 lot
+    vpp = vpp_1lot * float(lot)
+    if vpp <= 0: return None
+    return float(usd_amount) / vpp
+
+def _get_price_for_side(tick, side: str) -> float:
+    return float(tick.ask) if side.lower() == "buy" else float(tick.bid)
+
+# ==== SL/TP ҳисобкунии дақиқ ====
+SLTPUnits = Literal["points", "usd", "price"]
+
+@dataclass
+class SLTP:
+    sl: Optional[float]
+    tp: Optional[float]
+
+def _compute_sltp_exact(
+    symbol: str,
+    side: str,
+    entry_price: float,   # база = нархи вуруд/иҷро
+    lot: float,
+    sl_value: Optional[float],
+    tp_value: Optional[float],
+    units: SLTPUnits = "points",
+    enforce_exact: bool = True,
+) -> SLTP:
+    info = mt5.symbol_info(symbol)
+    if not info: raise RuntimeError("symbol_info failed")
+
+    pt = info.point
+    min_pts = _min_stops_points(symbol)
+
+    def _level_from_points(points: float, is_sl: bool) -> float:
+        if side.lower() == "buy":
+            level = entry_price - points * pt if is_sl else entry_price + points * pt
+        else:
+            level = entry_price + points * pt if is_sl else entry_price - points * pt
+        return _snap_price(symbol, level)
+
+    def _ensure_min(points: float, name: str) -> float:
+        if enforce_exact and points < min_pts:
+            raise ValueError(f"{name}={points:.1f} < min_stops={min_pts} points")
+        return max(points, float(min_pts))
+
+    sl = tp = None
+
+    if sl_value is not None:
+        if units == "points":
+            pts = _ensure_min(float(sl_value), "SL")
+            sl = _level_from_points(pts, True)
+        elif units == "usd":
+            pts = _usd_to_points(symbol, sl_value, lot)
+            if pts is None: raise ValueError("Cannot convert SL USD to points")
+            pts = _ensure_min(float(pts), "SL")
+            sl = _level_from_points(pts, True)
+        elif units == "price":
+            lvl = _snap_price(symbol, float(sl_value))
+            dist_pts = abs(lvl - entry_price) / pt
+            if enforce_exact and dist_pts < min_pts:
+                raise ValueError(f"SL distance {dist_pts:.1f} < min_stops={min_pts}")
+            sl = lvl
+        else:
+            raise ValueError("Unknown units for SL")
+
+    if tp_value is not None:
+        if units == "points":
+            pts = _ensure_min(float(tp_value), "TP")
+            tp = _level_from_points(pts, False)
+        elif units == "usd":
+            pts = _usd_to_points(symbol, tp_value, lot)
+            if pts is None: raise ValueError("Cannot convert TP USD to points")
+            pts = _ensure_min(float(pts), "TP")
+            tp = _level_from_points(pts, False)
+        elif units == "price":
+            lvl = _snap_price(symbol, float(tp_value))
+            dist_pts = abs(lvl - entry_price) / pt
+            if enforce_exact and dist_pts < min_pts:
+                raise ValueError(f"TP distance {dist_pts:.1f} < min_stops={min_pts}")
+            tp = lvl
+        else:
+            raise ValueError("Unknown units for TP")
+
+    return SLTP(sl=sl, tp=tp)
+
+# ==== Ёфтани последняя позиция ====
+def _latest_position_ticket(symbol: str, side: str) -> Optional[int]:
+    want = 0 if side.lower() == "buy" else 1
+    poss = mt5.positions_get(symbol=symbol) or []
+    poss = sorted(poss, key=lambda p: p.time_update, reverse=True)
+    for p in poss:
+        if int(p.type) == want:
+            return int(p.ticket)
     return None
 
-def adjust_lot_size(symbol, lot):
+# ==== Санҷиши бозор ====
+def is_market_open(symbol: str, recent_seconds: int = 180) -> Tuple[bool, str]:
     info = mt5.symbol_info(symbol)
-    min_lot = (info.volume_min or 0.01) if info else 0.01
-    max_lot = (info.volume_max or 100.0) if info else 100.0
-    lot_step = (info.volume_step or 0.01) if info else 0.01
-    v = max(min_lot, min(max_lot, float(lot)))
-    v = _round_to_step(v, lot_step, min_lot, max_lot)
-    print(f"ℹ️ Lot adjusted for {symbol}: {v}")
-    return v
+    if not info: return False, "no symbol info"
+    if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        return False, "trade disabled"
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick: return False, "no tick"
+    now_ts = time.time()
+    # Агар тики нав набошад — эҳтимол бозор баста, вале иҷозат медиҳем ки барномат бе краш кор кунад
+    if (now_ts - float(tick.time)) > recent_seconds:
+        return False, "no recent quotes"
+    return True, "ok"
 
-def calculate_points_from_usd(symbol, usd_amount, lot):
+# ==== Тағйири SL/TP баъд аз кушодан, бо нархи ИҶРО ====
+def _apply_sltp_to_position_with_base(
+    symbol: str,
+    side: str,
+    position_ticket: int,
+    executed_price: float,
+    lot: float,
+    sl: Optional[float],
+    tp: Optional[float],
+    units: SLTPUnits,
+    enforce_exact: bool,
+    tries: int = 3,
+    delay: float = 0.25,
+) -> bool:
+    sltp = _compute_sltp_exact(symbol, side, executed_price, lot, sl, tp, units, enforce_exact)
+    req = {"action": mt5.TRADE_ACTION_SLTP, "symbol": symbol, "position": int(position_ticket)}
+    if sltp.sl is not None: req["sl"] = float(sltp.sl)
+    if sltp.tp is not None: req["tp"] = float(sltp.tp)
+    last = None
+    for i in range(tries):
+        res = mt5.order_send(req); last = res
+        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            return True
+        time.sleep(delay * (i + 1))
+    return False
+
+# ==== Кушодани ордер ====
+def open_order(
+    symbol: str,
+    lot: float,
+    side: Literal["buy","sell"] = "buy",
+    sl: Optional[float] = None,
+    tp: Optional[float] = None,
+    sltp_units: SLTPUnits = "points",
+    deviation_points: Optional[int] = None,
+    enforce_exact: bool = True,
+    check_market: bool = True,
+    market_policy: Literal["return","raise"] = "return",  
+) -> dict:
+    if not mt5.initialize():
+        return {"ok": False, "error": f"MT5 init failed: {mt5.last_error()}"}
+    if not mt5.login(login=LOGIN, password=PASSWORD, server=SERVER):
+        return {"ok": False, "error": f"MT5 login failed: {mt5.last_error()}"}
+
+    if not mt5.symbol_select(symbol, True):
+        return {"ok": False, "error": f"symbol_select({symbol}) failed: {mt5.last_error()}"}
+
+    if check_market:
+        ok, why = is_market_open(symbol)
+        if not ok:
+            msg = f"Market closed for {symbol}: {why}"
+            if market_policy == "raise":
+                raise RuntimeError(msg)
+            return {"ok": False, "market_closed": True, "reason": why}
+
     info = mt5.symbol_info(symbol)
-    if not info:
-        print(f"⚠️ No symbol info for {symbol}; skip SL/TP")
-        return None
-    tick_value = info.trade_tick_value
-    tick_size  = info.trade_tick_size
-    point      = info.point
-    if not tick_value or not tick_size or not point:
-        print(f"⚠️ Invalid tick params for {symbol}; skip SL/TP")
-        return None
-    vpp_1lot = (tick_value / tick_size) * point
-    vpp_lot  = vpp_1lot * float(lot)
-    if vpp_lot <= 0:
-        print("⚠️ Non-positive value per point; skip SL/TP")
-        return None
-    pts = float(usd_amount) / vpp_lot
-    print(f"ℹ️ Points({symbol}): {pts:.6f} for USD={usd_amount}, lot={lot}")
-    return pts
+    if not info or info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
+        return {"ok": False, "error": "Symbol trade disabled or no info"}
 
-def respect_min_stop_distance(symbol, entry_price, sl_price, tp_price, order_type):
-    info = mt5.symbol_info(symbol)
-    if not info:
-        return sl_price, tp_price
-    point = info.point or 0.0
-    stops_level  = getattr(info, "stops_level", 0) * point
-    freeze_level = getattr(info, "freeze_level", 0) * point
-    min_dist = max(stops_level, freeze_level)
+    lot = _lot_sanitize(symbol, lot)
 
-    def _adj(target, is_tp):
-        if target is None: return None
-        if order_type == mt5.ORDER_TYPE_BUY:
-            if is_tp and target < entry_price + min_dist: return entry_price + min_dist
-            if not is_tp and target > entry_price - min_dist: return entry_price - min_dist
-        else:
-            if is_tp and target > entry_price - min_dist: return entry_price - min_dist
-            if not is_tp and target < entry_price + min_dist: return entry_price + min_dist
-        return target
+    tick = mt5.symbol_info_tick(symbol)
+    if not tick or not tick.bid or not tick.ask:
+        return {"ok": False, "error": "No market tick"}
 
-    new_sl = normalize_price(symbol, _adj(sl_price, False)) if sl_price is not None else None
-    new_tp = normalize_price(symbol, _adj(tp_price, True )) if tp_price is not None else None
-    return new_sl, new_tp
+    entry_price_pre = _get_price_for_side(tick, side)
+    try:
+        sltp_pre = _compute_sltp_exact(symbol, side, entry_price_pre, lot, sl, tp, sltp_units, enforce_exact)
+    except Exception as e:
+        return {"ok": False, "error": f"SLTP compute error: {e}"}
 
-def auto_deviation(symbol, mult=2.5, min_dev=5, max_dev=120):
-    info = mt5.symbol_info(symbol)
-    if not info or info.spread is None: return 50
-    dev = int(info.spread * mult)
-    return max(min_dev, min(max_dev, dev))
+    if deviation_points is None:
+        deviation_points = max(5, int(info.spread or 10) * 2)
 
-
-def compose_market_request(order_type, symbol, volume, price, sl=None, tp=None):
+    order_type = mt5.ORDER_TYPE_BUY if side.lower() == "buy" else mt5.ORDER_TYPE_SELL
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
-        "volume": float(volume),
         "type": order_type,
-        "price": normalize_price(symbol, float(price)),
-        "deviation": auto_deviation(symbol),
+        "volume": float(lot),
+        "price": float(entry_price_pre),
+        "deviation": int(deviation_points),
         "magic": 123456,
-        "comment": "auto",
         "type_time": mt5.ORDER_TIME_GTC,
+        "comment": "auto",
     }
-    if sl is not None: req["sl"] = float(sl)
-    if tp is not None: req["tp"] = float(tp)
-    return req
+    if sltp_pre.sl is not None: req["sl"] = float(sltp_pre.sl)
+    if sltp_pre.tp is not None: req["tp"] = float(sltp_pre.tp)
 
-def send_with_filling_fallback(base_request):
-    last = None
-    for mode in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
-        req = dict(base_request); req["type_filling"] = mode
-        print(f"📤 order_send with filling={mode}")
-        r = mt5.order_send(req)
-        last = r
-        if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f"✅ Order opened: ticket={r.order}")
-            return r
-        elif r:
-            print(f"❌ Error: retcode={r.retcode}, comment={r.comment}")
-        else:
-            print(f"❌ order_send=None, last_error={mt5.last_error()}")
-    return last
-
-def modify_sl_tp(position_ticket, symbol, sl_price=None, tp_price=None):
-    if sl_price is None and tp_price is None:
-        return True
-    req = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "symbol": symbol,
-        "position": int(position_ticket),
-    }
-    if sl_price is not None: req["sl"] = float(sl_price)
-    if tp_price is not None: req["tp"] = float(tp_price)
-    r = mt5.order_send(req)
-    if r and r.retcode == mt5.TRADE_RETCODE_DONE:
-        print(f"✅ SL/TP modified for pos={position_ticket}")
-        return True
-    print(f"❌ SLTP modify failed: {getattr(r,'retcode',None)} - {getattr(r,'comment',None)}")
-    return False
-
-def build_order_params(symbol, side, lot, sl_usd=None, tp_usd=None):
-    info = mt5.symbol_info(symbol)
-    tick = get_tick_retry(symbol)
-    if not info or not tick: return None
-    order_type = mt5.ORDER_TYPE_BUY if side.lower() == "buy" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
-    volume = adjust_lot_size(symbol, lot)
-
-    sl_price = tp_price = None
-
-    def _pts(usd):
-        try:
-            if usd is None: return None
-            u = float(usd)
-            if u <= 0: return None
-            return calculate_points_from_usd(symbol, u, volume)
-        except: return None
-
-    sl_pts = _pts(sl_usd); tp_pts = _pts(tp_usd)
-    if sl_pts is not None:
-        sl_price = price - sl_pts*info.point if order_type==mt5.ORDER_TYPE_BUY else price + sl_pts*info.point
-    if tp_pts is not None:
-        tp_price = price + tp_pts*info.point if order_type==mt5.ORDER_TYPE_BUY else price - tp_pts*info.point
-
-    sl_price, tp_price = respect_min_stop_distance(symbol, price, sl_price, tp_price, order_type)
-    return {"order_type": order_type, "price": price, "volume": volume, "sl": sl_price, "tp": tp_price}
-
-def open_order(symbol, lot, stop_loss_usd=None, take_profit_usd=None, side="buy", require_autotrading=False):
-    print(f"▶️ open_order(symbol={symbol}, side={side}, lot={lot}, SL_USD={stop_loss_usd}, TP_USD={take_profit_usd})")
-    if not initialize_mt5(): return False
-
-    enabled = check_autotrading_enabled()
-    if require_autotrading and not enabled:
-        return False 
-
-    if not ensure_symbol_ready(symbol):
-        return False
-
-    params = build_order_params(symbol, side, lot, stop_loss_usd, take_profit_usd)
-    if not params:
-        print("❌ Could not build params (no tick/info)")
-        return False
-
-    req1 = compose_market_request(params["order_type"], symbol, params["volume"], params["price"], sl=params["sl"], tp=params["tp"])
-    res = send_with_filling_fallback(req1)
+    res = _send_with_fillings(symbol, req)
 
     if not res or res.retcode != mt5.TRADE_RETCODE_DONE:
-        req2 = compose_market_request(params["order_type"], symbol, params["volume"], params["price"], sl=None, tp=None)
-        res2 = send_with_filling_fallback(req2)
-        if res2 and res2.retcode == mt5.TRADE_RETCODE_DONE and (params["sl"] is not None or params["tp"] is not None):
-            time.sleep(0.15) 
-            side_sign = 0 if params["order_type"] == mt5.ORDER_TYPE_BUY else 1
-            pos_ticket = None
-            for p in sorted(mt5.positions_get(symbol=symbol) or [], key=lambda x: x.time_update, reverse=True):
-                if p.type == side_sign:
-                    pos_ticket = p.ticket
-                    break
-            if pos_ticket:
-                modify_sl_tp(pos_ticket, symbol, params["sl"], params["tp"])
-        res = res2
+        if getattr(res, "retcode", None) == 10018: 
+            if market_policy == "raise":
+                raise RuntimeError("Market closed (server retcode=10018)")
+            return {"ok": False, "market_closed": True, "reason": "server: market closed"}
 
-    return bool(res and res.retcode == mt5.TRADE_RETCODE_DONE)
+        req2 = dict(req); req2.pop("sl", None); req2.pop("tp", None)
+        res2 = _send_with_fillings(symbol, req2)
+        if not res2 or res2.retcode != mt5.TRADE_RETCODE_DONE:
+            if getattr(res2, "retcode", None) == 10018:
+                if market_policy == "raise":
+                    raise RuntimeError("Market closed (server retcode=10018)")
+                return {"ok": False, "market_closed": True, "reason": "server: market closed"}
+            return {"ok": False, "error": f"Order open failed. retcode={getattr(res2,'retcode',None)} last_error={mt5.last_error()}"}
 
-def is_market_open(symbol):
+        executed_price = float(getattr(res2, "price", entry_price_pre))
+        time.sleep(0.10)
+        pos_ticket = _latest_position_ticket(symbol, side)
+        if pos_ticket and (sl is not None or tp is not None):
+            ok2 = _apply_sltp_to_position_with_base(
+                symbol, side, pos_ticket, executed_price, lot, sl, tp, sltp_units, enforce_exact
+            )
+            if not ok2:
+                return {"ok": False, "error": "Order opened but SL/TP post-modify failed",
+                        "executed_price": executed_price, "ticket": pos_ticket}
+        return {"ok": True, "mode": "post_modify", "executed_price": executed_price, "ticket": pos_ticket}
+
+    return {"ok": True, "mode": "attached",
+            "executed_price": float(getattr(res, "price", entry_price_pre)),
+            "deal": getattr(res, "deal", None)}
+
+def close_orders(symbol: Optional[str] = None,
+                 side: Optional[Literal["buy","sell"]] = None,
+                 include_pendings: bool = False,
+                 only_magic: Optional[int] = None,
+                 deviation_points: Optional[int] = None,
+                 market_policy: Literal["return","raise"] = "return",
+                 retries: int = 2,
+                 sleep: float = 0.2) -> dict:
     if not mt5.initialize():
-        print(f"❌ Ошибка: Не удалось инициализировать MT5: {mt5.last_error()}")
-        return False
+        return {"ok": False, "error": f"MT5 init failed: {mt5.last_error()}"}
+    if not mt5.login(login=LOGIN, password=PASSWORD, server=SERVER):
+        return {"ok": False, "error": f"MT5 login failed: {mt5.last_error()}"}
 
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        print(f"❌ Не удалось получить информацию о символе {symbol}: {mt5.last_error()}")
-        return False
-    
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None or tick.bid == 0 or tick.ask == 0:
-        print(f"❌ Не удалось получить текущие цены для {symbol}: {mt5.last_error()}")
-        return False
-    
-    current_time = datetime.datetime.now(pytz.timezone('Etc/GMT-3'))
-    day_of_week = current_time.weekday()
-    hour = current_time.hour
-    
-    if day_of_week == 5 and hour >= 17:
-        print(f"❌ Бозор баста аст: {current_time} (Шанбе пас аз 17:00 EST)")
-        return False
-    if day_of_week == 6:
-        print(f"❌ Бозор баста аст: {current_time} (Якшанбе)")
-        return False
-    
-    if symbol_info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
-        print(f"❌ Торговля для символа {symbol} отключена")
-        return False
-    
-    return True
+    results = {"closed_positions": 0, "canceled_pendings": 0, "errors": []}
 
-def close_all_positions():
-    if not initialize_mt5():
-        return False
-
-    positions = mt5.positions_get()
-    if positions is None:
-        print("❌ Ошибка получения позиций: ", mt5.last_error())
-        mt5.shutdown()
-        return False
-
-    if len(positions) == 0:
-        print("✅ Нет открытых позиций для закрытия.")
-        mt5.shutdown()
-        return True
-
-    all_closed = True
-    for pos in positions:
-        symbol = pos.symbol
-        volume = pos.volume
-        ticket = pos.ticket
-        price_tick = mt5.symbol_info_tick(symbol)
-        if price_tick is None:
-            print(f"❌ Не удалось получить цену для {symbol}")
-            all_closed = False
+    # --- Close positions ---
+    positions = mt5.positions_get() or []
+    for p in positions:
+        if symbol and p.symbol != symbol:
+            continue
+        if side is not None and ((side == "buy"  and p.type != mt5.POSITION_TYPE_BUY) or
+                                 (side == "sell" and p.type != mt5.POSITION_TYPE_SELL)):
+            continue
+        if only_magic is not None and int(getattr(p, "magic", 0)) != int(only_magic):
             continue
 
-        if pos.type == mt5.POSITION_TYPE_BUY:
-            close_price = price_tick.bid
-            order_type = mt5.ORDER_TYPE_SELL
-        elif pos.type == mt5.POSITION_TYPE_SELL:
-            close_price = price_tick.ask
-            order_type = mt5.ORDER_TYPE_BUY
-        else:
-            print(f"❌ Неизвестный тип позиции для тикета {ticket}")
-            all_closed = False
+        info = mt5.symbol_info(p.symbol)
+        tick = mt5.symbol_info_tick(p.symbol)
+        if not info or not tick:
+            results["errors"].append((int(p.ticket), "no symbol/tick"))
             continue
 
-        request = {
+        opp_type = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        close_price = float(tick.bid) if opp_type == mt5.ORDER_TYPE_SELL else float(tick.ask)
+        dev = deviation_points if deviation_points is not None else max(5, int((info.spread or 10) * 2))
+
+        req = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": volume,
-            "type": order_type,
-            "position": ticket,
+            "symbol": p.symbol,
+            "type": opp_type,
+            "position": int(p.ticket),
+            "volume": float(p.volume),
             "price": close_price,
-            "deviation": 20,
+            "deviation": int(dev),
             "magic": 123456,
-            "comment": "Закрытие позиции",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
+            "comment": "close_all",
         }
 
-        result = mt5.order_send(request)
+        res = None
+        success = False
+        for i in range(max(1, retries + 1)):
+            res = _send_with_fillings(p.symbol, req)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                results["closed_positions"] += 1
+                success = True
+                break
+            if getattr(res, "retcode", None) == 10018: 
+                if market_policy == "raise":
+                    return {"ok": False, "error": "market closed", "ticket": int(p.ticket)}
+                results["errors"].append((int(p.ticket), 10018, "market closed"))
+                break
+            time.sleep(sleep * (i + 1))
 
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            print(f"❌ Ошибка закрытия позиции {ticket}: {result.retcode if result else 'None'} - {result.comment if result else 'No result'}")
-            all_closed = False
-        else:
-            print(f"✅ Позиция {ticket} закрыта успешно")
+        if not success:
+            results["errors"].append((int(p.ticket), getattr(res, "retcode", None)))
 
-    mt5.shutdown()
-    return all_closed
+    if include_pendings:
+        orders = mt5.orders_get() or []
+        for o in orders:
+            if symbol and o.symbol != symbol:
+                continue
+            if only_magic is not None and int(getattr(o, "magic", 0)) != int(only_magic):
+                continue
+            req = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(o.ticket)}
+            res = mt5.order_send(req)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                results["canceled_pendings"] += 1
+            else:
+                if getattr(res, "retcode", None) == 10018 and market_policy == "return":
+                    results["errors"].append((int(o.ticket), 10018, "market closed"))
+                else:
+                    results["errors"].append((int(o.ticket), getattr(res, "retcode", None)))
+
+    results["ok"] = True
+    return results
 
 
-# if __name__ == "__main__":
-#     print(open_order('GBPUSDm', lot=0.01, stop_loss_usd=1,
-#                                     take_profit_usd=2.0, side='buy'))
+if __name__ == "__main__":
+    resp = open_order(
+        symbol="XAUUSDm",
+        lot=0.05,
+        side="sell",
+        sl=10, tp=10,
+        sltp_units="usd",
+        enforce_exact=True,
+    )
+    print(resp)
+

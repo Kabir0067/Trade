@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, sys, time, math, signal, random
+import os, sys, time, math, signal, random, re
 from dataclasses import dataclass, replace
 from typing import Dict, Tuple, Optional, List, Callable
 from datetime import datetime, time as dtime, timezone, timedelta
@@ -12,45 +12,63 @@ except Exception as e:
     raise RuntimeError("Лозим: pip install MetaTrader5 TA-Lib (бо бинари системавӣ).") from e
 
 try:
-    from zoneinfo import ZoneInfo  # py3.9+
+    from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-TARGET_BASE = ["EURUSD",  "XAUUSD", "BTCUSD",]
+# ------------------- BASES / TARGETS -------------------
+TARGET_BASE = ["EURUSD", "XAUUSD", "BTCUSD"]  # тартиби мақсаднок
+BASES = tuple(TARGET_BASE)
 
-STYLE   = os.getenv("TRADE_STYLE", "Scalping")         
-LOGIN    = int(os.getenv("MT5_LOGIN", "248532703"))
-PASSWORD = os.getenv("MT5_PASSWORD", "1q2w3e0p$Q")
-SERVER   = os.getenv("MT5_SERVER", "Exness-MT5Trial")
+# Афзалият дар tie-break: XAU > EUR > BTC
+PREFERRED_ORDER = ("XAUUSD", "EURUSD", "BTCUSD")
+_PREF_RANK = {b: i for i, b in enumerate(PREFERRED_ORDER)}
 
-TRADE_TZ = os.getenv("TRADE_TZ", "Asia/Dushanbe")
-TRADING_WINDOWS = os.getenv("TRADING_WINDOWS", "")  
-FX_DAYS = os.getenv("FX_DAYS", "")                   
+def _rank_base_of(symbol: str) -> int:
+    return _PREF_RANK.get(extract_base(symbol), 99)
 
-RELAXED = bool(int(os.getenv("RELAXED", "0")))         
+def extract_base(name: str) -> str:
+    """Аз номи брокер базаи дақиқ (EURUSD/XAUUSD/BTCUSD)-ро мебардорад."""
+    u = name.upper()
+    for b in BASES:
+        if u.startswith(b):
+            return b
+    m = re.search(r"(EURUSD|XAUUSD|BTCUSD)", u)
+    return m.group(1) if m else ""
 
-MIN_TICK_FRESH_SEC     = int(os.getenv("MIN_TICK_FRESH_SEC", "30"))
-MAX_BAR_STALENESS_MULT = float(os.getenv("MAX_BAR_STALENESS_MULT", "4.0"))
-SPREAD_SECONDS_BACK    = int(os.getenv("SPREAD_SECONDS_BACK", "180"))
-SPREAD_MED_MULT_MAX    = float(os.getenv("SPREAD_MED_MULT_MAX", "2.2"))
+STYLE   = "Scalping"
+LOGIN    = 248532703
+PASSWORD = "1q2w3e0p$Q"
+SERVER   = "Exness-MT5Trial"
 
-VETO_BB_POS_MARGIN = float(os.getenv("VETO_BB_POS_MARGIN", "0.05"))
-VETO_MIN_RSI_DIST  = float(os.getenv("VETO_MIN_RSI_DIST", "1.8"))  
+TRADE_TZ = "Asia/Dushanbe"
+TRADING_WINDOWS = ""
+FX_DAYS = ""
 
-MIN_SCORE_OK            = float(os.getenv("MIN_SCORE_OK", "44.0"))
-ADX_MIN                 = float(os.getenv("ADX_MIN", "18.0"))
-EMA200_ALIGN_REQUIRED   = bool(int(os.getenv("EMA200_ALIGN_REQUIRED", "0")))
-USE_CONFIRM_TF          = bool(int(os.getenv("USE_CONFIRM_TF", "1")))
+RELAXED = False
 
-STABILITY_CYCLES    = int(os.getenv("STABILITY_CYCLES", "1"))
-STABILITY_SLEEP_SEC = int(os.getenv("STABILITY_SLEEP_SEC", "1"))
+MIN_TICK_FRESH_SEC     = 30
+MAX_BAR_STALENESS_MULT = 4.0
+SPREAD_SECONDS_BACK    = 180
+SPREAD_MED_MULT_MAX    = 2.2
 
-RUN_FOREVER              = bool(int(os.getenv("RUN_FOREVER", "0")))
-LOOP_POLL_SEC            = float(os.getenv("LOOP_POLL_SEC", "3"))
-HYSTERESIS_SCORE_DELTA   = float(os.getenv("HYSTERESIS_SCORE_DELTA", "6.0"))  
-MIN_HOLD_SECONDS         = int(os.getenv("MIN_HOLD_SECONDS", "90"))           
+VETO_BB_POS_MARGIN     = 0.05
+VETO_MIN_RSI_DIST      = 1.8
 
-LOG_EVERY_N_LOOPS        = int(os.getenv("LOG_EVERY_N_LOOPS", "10"))
+MIN_SCORE_OK            = 44.0
+ADX_MIN                 = 18.0
+EMA200_ALIGN_REQUIRED   = False
+USE_CONFIRM_TF          = True
+
+STABILITY_CYCLES    = 1
+STABILITY_SLEEP_SEC = 1
+
+RUN_FOREVER              = False
+LOOP_POLL_SEC            = 3
+HYSTERESIS_SCORE_DELTA   = 6.0
+MIN_HOLD_SECONDS         = 90
+
+LOG_EVERY_N_LOOPS        = 10
 
 def log(level: str, msg: str):
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -86,7 +104,7 @@ _WINDOWS = _parse_windows(TRADING_WINDOWS)
 def _in_time_window_local(symbol: str) -> bool:
     now = _tz_now()
     wd = now.isoweekday()
-    is_crypto = symbol.upper().startswith(("BTC","XRP","LTC","ETH"))
+    is_crypto = extract_base(symbol) == "BTCUSD" or symbol.upper().startswith(("BTC", "XRP", "LTC", "ETH"))
     if not is_crypto:
         try:
             lo, hi = FX_DAYS.split("-")
@@ -147,33 +165,41 @@ def symbol_is_tradable(si) -> bool:
     return (vis in (None, True)) and (mode == mt5.SYMBOL_TRADE_MODE_FULL)
 
 def find_best_symbol_for(base_key: str) -> Optional[str]:
-    patterns = [f"{base_key}*", f"{base_key}m*", f"{base_key}.*"]
-    candidates = set()
-    for pat in patterns:
-        syms = mt5.symbols_get(pat) or []
-        for s in syms: candidates.add(s.name)
-    best = None; best_spr = 1e12
+    """Танҳо номҳои мутобиқ ба ҳамин база (EURUSD/XAUUSD/BTCUSD) баррасӣ мешаванд."""
+    syms = mt5.symbols_get(f"{base_key}*") or []
+    candidates = [s.name for s in syms if extract_base(s.name) == base_key]
+    if not candidates:
+        alt = mt5.symbols_get(f"{base_key.lower()}*") or []
+        candidates = [s.name for s in alt if extract_base(s.name) == base_key]
+
+    best, best_spr = None, 1e12
     for name in candidates:
         si = mt5.symbol_info(name)
         if si is None or not symbol_is_tradable(si): continue
         t = mt5.symbol_info_tick(name)
-        if not t or not si.point: continue
-        spr_pts = (t.ask - t.bid) / si.point if (t.ask and t.bid) else 1e12
+        if not t or not si.point or t.bid <= 0 or t.ask <= 0: continue
+        spr_pts = (t.ask - t.bid) / si.point
         if spr_pts < best_spr:
             best_spr = spr_pts; best = name
     return best
 
-def resolve_symbols() -> List[str]:
-    out: List[str] = []
-    for base in TARGET_BASE:
+def resolve_symbols(bases: Optional[List[str]] = None) -> List[str]:
+    """Ҳар база → як символ (спреди беҳтарин)."""
+    bases = bases or list(TARGET_BASE)
+    mapping: Dict[str, str] = {}
+    for base in bases:
         nm = find_best_symbol_for(base)
-        if nm: out.append(nm)
-        else: log("WARN", f"Broker symbol for {base} not found")
-    if not out: raise RuntimeError("No symbols resolved. Check server/account.")
+        if nm:
+            mapping[base] = nm
+        else:
+            log("WARN", f"Broker symbol for {base} not found")
+    out = [mapping[b] for b in bases if b in mapping]
+    if not out:
+        raise RuntimeError("No symbols resolved. Check server/account.")
     for s in out:
         if not mt5.symbol_select(s, True):
             log("WARN", f"symbol_select({s}) failed")
-    log("INFO", f"Symbols: {out}")
+    log("INFO", f"Symbols map: {mapping}")
     return out
 
 def trim_incomplete_last_bar(df: pd.DataFrame, tf: str) -> pd.DataFrame:
@@ -325,7 +351,7 @@ def tf_features(df: pd.DataFrame) -> Dict[str, float]:
     if ema20 is None or tr20 is None or np.isnan(ema20[-1]) or np.isnan(tr20[-1]):
         squeeze_on = False
     else:
-        kel_w = 3.0 * tr20[-1] 
+        kel_w = 3.0 * tr20[-1]
         bb_w_abs = abs((bb_w * (bb_mid + 1e-9)))
         squeeze_on = bool(bb_w_abs < kel_w)
 
@@ -363,6 +389,7 @@ def _bars_fresh_enough(df: pd.DataFrame, tf: str) -> bool:
     limit = int(tf_sec * MAX_BAR_STALENESS_MULT)
     return (now - last_close) <= limit
 
+# ------------------- CONFIGS -------------------
 @dataclass
 class StyleConfig:
     tfs: Tuple[str, str]
@@ -460,10 +487,9 @@ MICRO_OVERRIDES: Dict[str, MicroProfile] = {
 }
 
 def _base_key_for(symbol: str) -> str:
-    s = symbol.upper()
-    for b in ("EURUSD","XAUUSD","BTCUSD","GBPUSD"):
-        if s.startswith(b): return b
-    return "EURUSD"
+    """Базаи дақиқ аз номи символ; фоллбэк EURUSD."""
+    b = extract_base(symbol)
+    return b if b else "EURUSD"
 
 def micro_ok(symbol: str,
              window_sec: int = 4,
@@ -485,7 +511,7 @@ def micro_ok(symbol: str,
         start_dt = end_dt - timedelta(seconds=window_sec)
         ticks = mt5.copy_ticks_range(symbol, start_dt, end_dt, mt5.COPY_TICKS_INFO)
         if ticks is None or len(ticks) < max(4, window_sec*2):
-            return True, "", 0.0  
+            return True, "", 0.0  # ҳеҷ маълумоти кифоя — иҷозат
 
         b = np.array([t["bid"] for t in ticks if t["bid"] > 0], dtype=float)
         a = np.array([t["ask"] for t in ticks if t["ask"] > 0], dtype=float)
@@ -528,7 +554,7 @@ def micro_ok(symbol: str,
 
 def _slope_threshold(symbol: str) -> float:
     base = _base_key_for(symbol)
-    return 0.00006 if base in ("EURUSD","XAUUSD") else 0.00012  
+    return 0.00006 if base in ("EURUSD","XAUUSD") else 0.00012
 
 def veto_and_confluence(
     cfg: StyleConfig,
@@ -621,7 +647,7 @@ def veto_and_confluence(
     adx_avg = (extra.get("adx1", 0.0) + extra.get("adx2", 0.0)) / 2.0 if extra else 0.0
     if adx_avg >= (cfg.adx_min + 8.0):      dyn_min -= 6.0
     if f1["bb_z"] >= (cfg.bb_width_min_z + 1.0): dyn_min -= 4.0
-    if bool(f1.get("squeeze_on", 0.0)):   dyn_min += 4.0  
+    if bool(f1.get("squeeze_on", 0.0)):   dyn_min += 4.0
     dyn_min = max(30.0, dyn_min)
 
     if not relaxed and conf < dyn_min:
@@ -699,6 +725,7 @@ def scored(
     score = max(-100.0, min(100.0, score))
     return score, parts
 
+# ------------------- SELECTOR -------------------
 class SymbolSelector:
     def __init__(self, style: str, symbols: List[str], strict: bool = True, relaxed: Optional[bool] = None):
         assert style in ("Scalping", "Intraday")
@@ -715,7 +742,11 @@ class SymbolSelector:
                 adx_min=max(8.0, cfg.adx_min - 5.0)
             )
         self.cfg_base = cfg
-        self.base_key_map = {s: next((b for b in TARGET_BASE if s.startswith(b)), TARGET_BASE[0]) for s in symbols}
+
+        # Ислоҳ: база барои ҳар символ аз extract_base
+        self.base_key_map = {s: (extract_base(s) or "EURUSD") for s in symbols}
+
+        # override-ҳои дақиқ барои EURUSD/XAUUSD/BTCUSD
         self.cfg_by_symbol = {s: apply_overrides(cfg, self.base_key_map[s], style) for s in symbols}
 
     def _calc_one(self, s: str) -> Dict[str, float]:
@@ -822,10 +853,13 @@ class SymbolSelector:
             source = valid if valid else raw_results
             best = sorted(
                 source.items(),
-                key=lambda kv: (-kv[1].get("score",-1e9),
-                                kv[1].get("spread_to_atr",1e9),
-                                -kv[1].get("confluence",0.0),
-                                kv[0])
+                key=lambda kv: (
+                    -kv[1].get("score",-1e9),
+                    _rank_base_of(kv[0]),                         # афзалият: XAU > EUR > BTC
+                    kv[1].get("spread_to_atr",1e9),
+                    -kv[1].get("confluence",0.0),
+                    kv[0]
+                )
             )[0][0]
             return (best, raw_results) if return_details else best
 
@@ -844,13 +878,20 @@ class SymbolSelector:
             return (best, raw_results) if return_details else best
 
         best = sorted(stable_results.items(),
-                      key=lambda kv: (-kv[1]["score"], kv[1]["spread_to_atr"], -kv[1]["confluence"], kv[0]))[0][0]
+                      key=lambda kv: (
+                          -kv[1]["score"],
+                          _rank_base_of(kv[0]),                     # афзалият: XAU > EUR > BTC
+                          kv[1]["spread_to_atr"],
+                          -kv[1]["confluence"],
+                          kv[0]
+                      ))[0][0]
         if return_details:
             merged = {**raw_results}
             for k,v in stable_results.items(): merged[k] = v
             return best, merged
         return best
 
+# ------------------- API -------------------
 def ensure_initialized() -> MT5Watchdog:
     wd = MT5Watchdog(LOGIN, PASSWORD, SERVER)
     if not wd.ensure():
@@ -864,7 +905,7 @@ def get_best_symbol(style: str = STYLE, symbols: Optional[List[str]] = None,
         if not wd.ensure():
             return "NO_TRADE"
         if not symbols:
-            symbols = resolve_symbols()
+            symbols = resolve_symbols(bases=TARGET_BASE)  # танҳо 3 база
         else:
             for s in symbols: mt5.symbol_select(s, True)
 
@@ -875,17 +916,17 @@ def get_best_symbol(style: str = STYLE, symbols: Optional[List[str]] = None,
 
         if RELAXED or not use_block:
             best, info = selector.choose(return_details=True)
-            for s, v in info.items():
-                log("INFO", f"{s} | veto_ok={v.get('veto_ok')} score={round(v.get('score',0),2)} "
-                            f"spr/ATR={round(v.get('spread_to_atr',0),3)} "
-                            f"ATRr={round(v.get('f1_atr_ratio',0),2)}/{round(v.get('f2_atr_ratio',0),2)} "
-                            f"BBz={round(v.get('f1_bb_z',0),2)}/{round(v.get('f2_bb_z',0),2)} "
-                            f"BBpos={round(v.get('f1_bb_pos',0),2)}/{round(v.get('f2_bb_pos',0),2)} "
-                            f"slope={round(v.get('f1_slope',0),6)}/{round(v.get('f2_slope',0),6)} "
-                            f"ADX={round(v.get('adx1',0),1)}/{round(v.get('adx2',0),1)} "
-                            f"EMA200={round(v.get('ema1',0),4)}/{round(v.get('ema2',0),4)} "
-                            f"tick_age={round(v.get('tick_age',0),1)}s")
-            log("INFO", f"Best: {best}")
+            # for s, v in info.items():
+            #     log("INFO", f"{s} | veto_ok={v.get('veto_ok')} score={round(v.get('score',0),2)} "
+            #                 f"spr/ATR={round(v.get('spread_to_atr',0),3)} "
+            #                 f"ATRr={round(v.get('f1_atr_ratio',0),2)}/{round(v.get('f2_atr_ratio',0),2)} "
+            #                 f"BBz={round(v.get('f1_bb_z',0),2)}/{round(v.get('f2_bb_z',0),2)} "
+            #                 f"BBpos={round(v.get('f1_bb_pos',0),2)}/{round(v.get('f2_bb_pos',0),2)} "
+            #                 f"slope={round(v.get('f1_slope',0),6)}/{round(v.get('f2_slope',0),6)} "
+            #                 f"ADX={round(v.get('adx1',0),1)}/{round(v.get('adx2',0),1)} "
+            #                 f"EMA200={round(v.get('ema1',0),4)}/{round(v.get('ema2',0),4)} "
+            #                 f"tick_age={round(v.get('tick_age',0),1)}s")
+            # log("INFO", f"Best: {best}")
             return best
 
         while True:
@@ -902,6 +943,7 @@ def get_best_symbol(style: str = STYLE, symbols: Optional[List[str]] = None,
 def choose_once() -> str:
     return get_best_symbol(style=STYLE, symbols=None, block_until_tradeable=False)
 
+# ------------------- SERVICE -------------------
 class SymbolPickerService:
     def __init__(self,
                  style: str = STYLE,
@@ -945,7 +987,7 @@ class SymbolPickerService:
             while not self._stop and not self.wd.ensure():
                 time.sleep(1.0)
             if self._stop: return
-            self.symbols = resolve_symbols()
+            self.symbols = resolve_symbols(bases=TARGET_BASE)
         else:
             for s in self.symbols: mt5.symbol_select(s, True)
 
@@ -978,6 +1020,7 @@ class SymbolPickerService:
 
         self.wd.shutdown()
 
+# ------------------- MAIN -------------------
 if __name__ == "__main__":
     if RUN_FOREVER:
         def print_update(best: str, info: Dict[str,Dict[str,float]]):
