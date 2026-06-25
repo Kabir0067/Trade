@@ -1,0 +1,12 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Runtime artifacts
+news_cache_gold.json
+Logs/
+runserver_start.bat

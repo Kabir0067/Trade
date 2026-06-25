@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Logs
+Logs/
+*.log
+
+# Virtual environments
+.venv/
+
+# Secrets
+.env
