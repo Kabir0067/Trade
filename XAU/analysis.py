@@ -451,7 +451,7 @@ class MultiTimeframeSignalEngine:
         if not (np.isfinite(price) and np.isfinite(atr) and atr > 0):
             return None
 
-        # FIX #5: Fetch live spread and use as a buffer for SL placement.
+        # Fetch live spread and use as a buffer for SL placement.
         # This prevents the spread itself from triggering the stop on entry
         # or during news spikes when spreads widen dramatically.
         try:
@@ -568,12 +568,14 @@ class MultiTimeframeSignalEngine:
         total_buy = total_sell = 0.0
         tf_buy = tf_sell = 0
         tf_results = []
+        tf_scores = {}
         agg = {"smc": 0.0, "momentum": 0.0, "reversion": 0.0, "confirm": 0.0, "volume": 0.0}
         anchor_dir, anchor_score, anchor_name = None, 0, ""
 
         for it in per_tf:
             tf, weight, name, c, p = it['tf'], it['weight'], it['name'], it['c'], it['p']
             buy_s, sell_s, brk = _score_timeframe(c, p)
+            tf_scores[name] = (buy_s, sell_s)
 
             if buy_s > sell_s and buy_s >= config.TF_AGREE_MIN_SCORE:
                 tf_buy += 1
@@ -600,7 +602,7 @@ class MultiTimeframeSignalEngine:
 
         return {"total_buy": total_buy, "total_sell": total_sell, "tf_buy": tf_buy,
                 "tf_sell": tf_sell, "agg": agg, "anchor_dir": anchor_dir,
-                "anchor_name": anchor_name, "tf_results": tf_results}
+                "anchor_name": anchor_name, "tf_results": tf_results, "tf_scores": tf_scores}
 
     # ── turn one version's aggregate into a full decision dict ───────────────
     def _decide(self, aggr, shared):
@@ -661,6 +663,35 @@ class MultiTimeframeSignalEngine:
                 and tf_sell >= config.MIN_TF_AGREE and anchor_dir == "SELL"):
             signal_dir, score = "SELL", conf_sell
 
+        # ── Higher-timeframe context guard (D1 macro + H1 intraday) ──────────────
+        # Execution TFs lead the 10-40 min scalp, but taking a trade straight into a
+        # strong higher-TF trend is the main losing pattern. A higher TF "opposes" only
+        # when its OWN raw score on the other side is ≥ TF_AGREE_MIN_SCORE (i.e. it would
+        # independently vote the opposite direction). One opposing TF → confidence
+        # penalty (re-gated against MIN_CONFIDENCE); both D1+H1 opposing → veto.
+        if signal_dir is not None and config.HTF_GUARD_ENABLED:
+            tf_scores = aggr.get('tf_scores', {})
+
+            def _htf_opposes(tf_name):
+                bs, ss = tf_scores.get(tf_name, (0.0, 0.0))
+                opp = ss if signal_dir == "BUY" else bs   # score on the side AGAINST us
+                own = bs if signal_dir == "BUY" else ss
+                return opp >= config.TF_AGREE_MIN_SCORE and opp > own
+
+            against = [t for t in config.HTF_GUARD_TFS if _htf_opposes(t)]
+            if len(against) >= 2:
+                return {**base, "signal": "NEUTRAL",
+                        "reason": f"HTF veto: {'+'.join(against)} oppose {signal_dir}"}
+            if len(against) == 1:
+                score = int(score * config.HTF_PENALTY)
+                if signal_dir == "BUY":
+                    base["buy_conf"] = score
+                else:
+                    base["sell_conf"] = score
+                if score < config.MIN_CONFIDENCE:
+                    return {**base, "signal": "NEUTRAL",
+                            "reason": f"HTF conflict: {against[0]} opposes {signal_dir} — conf {score}% < {config.MIN_CONFIDENCE}%"}
+
         if signal_dir is None:
             reasons = []
             if anchor_dir is None:
@@ -684,6 +715,23 @@ class MultiTimeframeSignalEngine:
         if signal_dir == "SELL" and exec_z <= -ext:
             return {**base, "signal": "NEUTRAL",
                     "reason": f"Overextended {exec_z:.1f}σ — not chasing the bottom"}
+
+        # Weak trigger candle: skip a doji-ish entry unless the signal is very strong
+        # or the bar carried high volume (a real institutional push).
+        exec_body_atr = shared.get('exec_body_atr', 0.0)
+        if (score < config.STRONG_SIGNAL_IGNORE_BODY_SCORE
+                and not shared.get('exec_high_volume')
+                and exec_body_atr < config.MIN_TRIGGER_BODY_ATR):
+            return {**base, "signal": "NEUTRAL",
+                    "reason": f"Trigger candle too weak ({exec_body_atr:.2f} ATR)"}
+
+        # Anti-stop-hunt: stand aside on a VIOLENT manipulation/news spike candle
+        # (range >> ATR). Gold wicks hard on NFP/CPI/FOMC, hunts stops, then reverses —
+        # entering there is exactly how the stop gets taken. Disable with MAX_TRIGGER_RANGE_ATR=99.
+        exec_range_atr = shared.get('exec_range_atr', 0.0)
+        if exec_range_atr > config.MAX_TRIGGER_RANGE_ATR:
+            return {**base, "signal": "NEUTRAL",
+                    "reason": f"Volatility spike ({exec_range_atr:.1f}×ATR) — not chasing manipulation"}
 
         sltp = self._compute_smart_sl_tp(signal_dir, exec_df, m15_df, last_close, sl_tp_atr)
         if sltp is None:
@@ -722,6 +770,9 @@ class MultiTimeframeSignalEngine:
         last_close = last_atr = exec_atr = None
         exec_df = m15_df = None
         exec_z = 0.0                          # exec-TF z-score (price vs 20-bar mean, σ)
+        exec_body_atr = 0.0                   # trigger-candle body size in ATR units
+        exec_range_atr = 0.0                  # trigger-candle full range in ATR units
+        exec_high_volume = False              # was the trigger candle a high-volume bar?
         for tf, weight, name in MASTER_TIMEFRAMES:
             try:
                 raw = self.data_engine.get_data(specific_tf=tf)
@@ -734,6 +785,10 @@ class MultiTimeframeSignalEngine:
                 if tf == mt5.TIMEFRAME_M5:
                     exec_df, exec_atr = analyzed, num(c.get('atr'))
                     exec_z = num(c.get('zscore'))
+                    if exec_atr and exec_atr > 0:
+                        exec_body_atr = num(c.get('body_size')) / exec_atr
+                        exec_range_atr = (num(c.get('high')) - num(c.get('low'))) / exec_atr
+                    exec_high_volume = bool(c.get('high_volume'))
                 if tf == mt5.TIMEFRAME_M15:
                     m15_df, last_close, last_atr = analyzed, c.get('close'), num(c.get('atr'))
                 per_tf.append({"tf": tf, "weight": weight, "name": name, "c": c, "p": p})
@@ -768,7 +823,8 @@ class MultiTimeframeSignalEngine:
 
         shared = {"last_close": last_close, "last_atr": last_atr, "sl_tp_atr": sl_tp_atr,
                   "exec_df": exec_df, "m15_df": m15_df, "timing": timing,
-                  "exec_z": exec_z}
+                  "exec_z": exec_z, "exec_body_atr": exec_body_atr,
+                  "exec_range_atr": exec_range_atr, "exec_high_volume": exec_high_volume}
 
         # ── ONE engine: classic multi-TF confluence (the data-proven path) ──
         decision = self._decide(self._aggregate(per_tf), shared)

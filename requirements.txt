@@ -3,4 +3,3 @@ pandas==2.2.3
 ./_mt5_isolation/ta_lib-0.6.4-cp312-cp312-win_amd64.whl
 MetaTrader5==5.0.5735
 pyTelegramBotAPI==4.34.0
-requests==2.34.2

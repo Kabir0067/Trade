@@ -544,12 +544,14 @@ class MultiTimeframeSignalEngine:
         total_buy = total_sell = 0.0
         tf_buy = tf_sell = 0
         tf_results = []
+        tf_scores = {}
         agg = {"smc": 0.0, "momentum": 0.0, "reversion": 0.0, "confirm": 0.0, "volume": 0.0}
         anchor_dir, anchor_score, anchor_name = None, 0, ""
 
         for it in per_tf:
             tf, weight, name, c, p = it['tf'], it['weight'], it['name'], it['c'], it['p']
             buy_s, sell_s, brk = _score_timeframe(c, p)
+            tf_scores[name] = (buy_s, sell_s)
 
             if buy_s > sell_s and buy_s >= config.TF_AGREE_MIN_SCORE:
                 tf_buy += 1
@@ -576,7 +578,7 @@ class MultiTimeframeSignalEngine:
 
         return {"total_buy": total_buy, "total_sell": total_sell, "tf_buy": tf_buy,
                 "tf_sell": tf_sell, "agg": agg, "anchor_dir": anchor_dir,
-                "anchor_name": anchor_name, "tf_results": tf_results}
+                "anchor_name": anchor_name, "tf_results": tf_results, "tf_scores": tf_scores}
 
     def _decide(self, aggr, shared):
         last_close, last_atr = shared['last_close'], shared['last_atr']
@@ -639,6 +641,35 @@ class MultiTimeframeSignalEngine:
                 and tf_sell >= config.MIN_TF_AGREE and anchor_dir == "SELL"
                 and edge >= config.MIN_CONF_EDGE):
             signal_dir, score = "SELL", conf_sell
+
+        # ── Higher-timeframe context guard (D1 macro + H1 intraday) ──────────────
+        # Execution TFs lead the 10-40 min scalp, but taking a trade straight into a
+        # strong higher-TF trend is the main losing pattern. A higher TF "opposes" only
+        # when its OWN raw score on the other side is ≥ TF_AGREE_MIN_SCORE (i.e. it would
+        # independently vote the opposite direction). One opposing TF → confidence
+        # penalty (re-gated against MIN_CONFIDENCE); both D1+H1 opposing → veto.
+        if signal_dir is not None and config.HTF_GUARD_ENABLED:
+            tf_scores = aggr.get('tf_scores', {})
+
+            def _htf_opposes(tf_name):
+                bs, ss = tf_scores.get(tf_name, (0.0, 0.0))
+                opp = ss if signal_dir == "BUY" else bs   # score on the side AGAINST us
+                own = bs if signal_dir == "BUY" else ss
+                return opp >= config.TF_AGREE_MIN_SCORE and opp > own
+
+            against = [t for t in config.HTF_GUARD_TFS if _htf_opposes(t)]
+            if len(against) >= 2:
+                return {**base, "signal": "NEUTRAL",
+                        "reason": f"HTF veto: {'+'.join(against)} oppose {signal_dir}"}
+            if len(against) == 1:
+                score = int(score * config.HTF_PENALTY)
+                if signal_dir == "BUY":
+                    base["buy_conf"] = score
+                else:
+                    base["sell_conf"] = score
+                if score < config.MIN_CONFIDENCE:
+                    return {**base, "signal": "NEUTRAL",
+                            "reason": f"HTF conflict: {against[0]} opposes {signal_dir} — conf {score}% < {config.MIN_CONFIDENCE}%"}
 
         if signal_dir is None:
             reasons = []

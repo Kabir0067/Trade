@@ -1,0 +1,12 @@
+# Keep all text files LF so the two bot trees (BTC/ and XAU/) stay byte-comparable
+# and a cross-bot diff shows only real logic drift, not line-ending noise.
+* text=auto eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+# Windows-only launchers stay CRLF
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+# Binary assets — never normalize/diff
+*.whl  binary
+*.exe  binary

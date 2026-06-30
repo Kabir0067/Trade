@@ -216,7 +216,9 @@ def manage_positions(symbol=None):
                 improves = be > p.sl
             else:
                 be = st["entry"] - buf - spread_buffer   # spread-aware BE
-                improves = p.sl > 0 and be < p.sl
+                # symmetric with BUY: also install BE on a SELL that has NO stop
+                # (p.sl == 0), instead of leaving it unprotected at break-even
+                improves = (p.sl <= 0) or (be < p.sl)
             if improves and modify_sl(p.ticket, be):
                 st["be_done"] = True
                 dirty = True

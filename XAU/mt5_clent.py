@@ -5,6 +5,7 @@
 """
 
 import functools
+import math
 import os
 import subprocess
 import threading
@@ -302,35 +303,42 @@ def _kill_terminal_by_path(path):
         return 0
 
 
-@_locked
 def restart_terminal():
     """Hard-recover a HUNG MT5 terminal: shut the API down, KILL only THIS bot's
     terminal (matched by MT5_PATH), then relaunch it from MT5_PATH (so the live
     session reconnects). Requires MT5_PATH. Returns True if the relaunch + attach
-    succeeded. No-op (returns False) when MT5_PATH is not configured."""
+    succeeded. No-op (returns False) when MT5_PATH is not configured.
+
+    NOTE: deliberately NOT @_locked. The kill + 6s settle must NOT hold mt5_lock,
+    or every order/close/SL-modify on the Telegram thread freezes for the whole
+    recovery window. We take the lock only for the two brief MT5 calls (shutdown
+    and re-initialize); the terminal is down during the sleep anyway, so a manual
+    order tap fails fast against the dead terminal instead of blocking on it."""
     global _last_terminal_restart, _SERVER_UTC_OFFSET_H, _SERVER_UTC_OFFSET_TS
     if not config.MT5_PATH:
         print("⚠️ Cannot auto-restart terminal: MT5_PATH not set in .env")
         return False
     _last_terminal_restart = time.time()
-    try:
-        mt5.shutdown()
-    except Exception:
-        pass
+    with mt5_lock:
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
     # force-close ONLY this bot's (possibly frozen) terminal — by path, never /IM
     killed = _kill_terminal_by_path(config.MT5_PATH)
     print(f"   killed {killed} terminal process(es) at {config.MT5_PATH}")
     time.sleep(6)                       # let the OS release the process + file locks
     _SERVER_UTC_OFFSET_H = None         # force a fresh offset re-derivation after restart
     _SERVER_UTC_OFFSET_TS = 0.0
-    try:
-        ok = bool(mt5.initialize(path=config.MT5_PATH))
-        if not ok:
-            print(f"❌ relaunch initialize() failed: {mt5.last_error()}")
-        return ok
-    except Exception as e:
-        print(f"❌ relaunch exception: {e}")
-        return False
+    with mt5_lock:
+        try:
+            ok = bool(mt5.initialize(path=config.MT5_PATH))
+            if not ok:
+                print(f"❌ relaunch initialize() failed: {mt5.last_error()}")
+            return ok
+        except Exception as e:
+            print(f"❌ relaunch exception: {e}")
+            return False
 
 
 def seconds_since_terminal_restart():
@@ -429,8 +437,17 @@ def open_order(order_type, lot_size, sl=None, tp=None, risk=None, reward=None,
 
     # clamp volume to broker limits + step (explicit guard against a 0/None step)
     step = si.volume_step if (si.volume_step and si.volume_step > 0) else 0.01
-    lot_size = max(si.volume_min, min(lot_size, si.volume_max))
-    lot_size = round(round(lot_size / step) * step, 2)
+    # Defense-in-depth: open_order is the ONE function that commits capital, so it
+    # enforces this bot's own hard cap (config.MAX_LOT) here too — never trusting
+    # every caller (incl. the open_order_xauusd wrapper) to clamp first.
+    cap = si.volume_max
+    if getattr(config, "MAX_LOT", 0):
+        cap = min(cap, config.MAX_LOT)
+    lot_size = min(lot_size, cap)
+    # FLOOR to the volume step (never round up) so realized size can't silently
+    # exceed the risk budget; then never go below the broker minimum. (+1e-9 keeps
+    # float division like 0.03/0.01 from flooring to the wrong step.)
+    lot_size = round(max(si.volume_min, math.floor(lot_size / step + 1e-9) * step), 2)
 
     price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 

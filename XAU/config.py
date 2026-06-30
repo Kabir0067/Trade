@@ -134,6 +134,22 @@ MIN_CONFIDENCE     = _env("MIN_CONFIDENCE",     65, int)
 TF_AGREE_MIN_SCORE = _env("TF_AGREE_MIN_SCORE", 22, int)
 CONF_SCALE         = _env("CONF_SCALE",       58.0, float)
 
+# Higher-timeframe context guard — filters counter-trend scalps. A higher TF (D1/H1)
+# "opposes" the signal when its OWN raw score on the other side is ≥ TF_AGREE_MIN_SCORE
+# (i.e. it would independently vote the opposite way). One opposing TF → confidence
+# ×HTF_PENALTY (re-gated vs MIN_CONFIDENCE); both D1+H1 opposing → signal vetoed.
+# Disable with HTF_GUARD_ENABLED=0. Execution-TF dominance (M15/M5/M1) is unchanged.
+HTF_GUARD_ENABLED  = _env("HTF_GUARD_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+HTF_GUARD_TFS      = ("D1", "H1")    # macro + intraday trend context for a 10-40 min trade
+HTF_PENALTY        = _env("HTF_PENALTY", 0.75, float)
+
+# Trigger-candle quality (gold). Skip a doji-ish entry unless the signal is very strong
+# (≥ STRONG_SIGNAL_IGNORE_BODY_SCORE) or the bar had high volume; and stand aside on a
+# violent news spike (range ≫ ATR) — gold wicks hard on NFP/CPI/FOMC and hunts stops.
+MIN_TRIGGER_BODY_ATR            = _env("MIN_TRIGGER_BODY_ATR", 0.10, float)   # min trigger body in ATR
+STRONG_SIGNAL_IGNORE_BODY_SCORE = _env("STRONG_SIGNAL_IGNORE_BODY_SCORE", 82, int)  # very strong → bypass body filter
+MAX_TRIGGER_RANGE_ATR           = _env("MAX_TRIGGER_RANGE_ATR", 3.5, float)   # tighter than BTC (gold spikes sharper)
+
 # ─────────────────────────────────────────────────────────────────────────
 #  SL / TP  —  scalp-sized (reachable inside 10-40 min)
 # ─────────────────────────────────────────────────────────────────────────
@@ -201,7 +217,7 @@ TRAIL_SMOOTH_BARS    = _env("TRAIL_SMOOTH_BARS", 5, int)     # EMA smoothing for
 # (lock the small profit before it reverts). 0 disables. Matches the 10-40 min
 # trade horizon. (Losers are left to the SL; this only harvests stale winners.)
 TIME_STOP_MIN            = _env("TIME_STOP_MIN", 40, int)
-TIME_STOP_MIN_PROFIT_USD = _env("TIME_STOP_MIN_PROFIT_USD", 0.10, float)
+TIME_STOP_MIN_PROFIT_USD = _env("TIME_STOP_MIN_PROFIT_USD", 0.50, float)
 # NOTE: the bot manages ONLY its own orders (magic 234000) — manually-opened
 # trades are deliberately left untouched (owner decision).
 

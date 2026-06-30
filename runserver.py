@@ -93,7 +93,8 @@ class Bot:
         self.proc: Optional[subprocess.Popen] = None
         self.restarts = 0
         self.restart_delay = 5.0
-        self.next_start = 0.0  
+        self.next_start = 0.0
+        self.started_at = 0.0   # monotonic time of the last successful launch
 
 
 BOTS: List[Bot] = [
@@ -337,10 +338,12 @@ def _creation_flags() -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 # 3) Launch + supervise both bot watchdogs
 # ─────────────────────────────────────────────────────────────────────────────
-def start_bot(bot: Bot) -> None:
+def start_bot(bot: Bot) -> bool:
+    """Launch one bot watchdog. Returns True on success, False if the launch itself
+    failed (so the supervisor can back off instead of re-spinning every 2s)."""
     if not bot.runserver.exists():
         log(f"[{bot.name}] ERROR {bot.runserver} not found — cannot start.")
-        return
+        return False
     py = root_python()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     fh = bot.console_log.open("ab", buffering=0)
@@ -353,12 +356,15 @@ def start_bot(bot: Bot) -> None:
             stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             creationflags=_creation_flags())
         bot._log_handle = fh  # type: ignore[attr-defined]
+        bot.started_at = time.monotonic()
         log(f"[{bot.name}] STARTED watchdog (pid={bot.proc.pid}) -> terminal "
             f"{bot.terminal}")
+        return True
     except Exception as exc:
         fh.close()
         bot.proc = None
         log(f"[{bot.name}] ERROR failed to start: {exc}")
+        return False
 
 
 def stop_bot(bot: Bot, timeout: float = 30.0) -> None:
@@ -496,13 +502,26 @@ def supervise() -> int:
                             pass
                     bot.proc = None
                     bot.restarts += 1
-                    bot.restart_delay = min(60.0, max(5.0, bot.restart_delay * 1.5))
+                    # Reset the backoff after a long healthy run (mirrors the per-bot
+                    # watchdog) so an isolated crash weeks later restarts promptly
+                    # instead of eating the full 60s that early flapping pinned.
+                    uptime = (now - bot.started_at) if bot.started_at else 0.0
+                    if uptime >= 300.0:
+                        bot.restart_delay = 5.0
+                    else:
+                        bot.restart_delay = min(60.0, max(5.0, bot.restart_delay * 1.5))
                     bot.next_start = now + bot.restart_delay
                     log(f"[{bot.name}] watchdog exited (code={code}). "
                         f"restart #{bot.restarts} in {bot.restart_delay:.0f}s.")
                     continue
                 if now >= bot.next_start:  # time to (re)start
-                    start_bot(bot)
+                    if not start_bot(bot):
+                        # the launch ITSELF failed (missing file, disk full, venv gone
+                        # mid-update) — back off instead of re-spinning every 2s and
+                        # churning CPU/SSD on the undersized VPS.
+                        bot.restart_delay = min(60.0, max(5.0, bot.restart_delay * 1.5))
+                        bot.next_start = now + bot.restart_delay
+                        log(f"[{bot.name}] start failed — retry in {bot.restart_delay:.0f}s.")
             _write_health(started_utc)
             stop_event.wait(2.0)
     finally:

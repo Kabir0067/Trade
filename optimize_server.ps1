@@ -124,23 +124,24 @@ Set-ItemProperty -Path $PerfPath -Name "TaskbarAnimations" -Value 0 -Type DWORD 
 # ----------------------------------------------------------------------
 # 9. OPTIMIZE VIRTUAL MEMORY (Pagefile) FOR 4GB RAM
 # ----------------------------------------------------------------------
-# Set a FIXED pagefile size: min=4096MB, max=4096MB (matches RAM).
-# A fixed size prevents fragmentation and the constant resize I/O.
-# With 4GB RAM + 4GB pagefile, the system has 8GB virtual memory total.
+# Set a FIXED pagefile size: min=8192MB, max=8192MB (2x the 4GB RAM).
+# A fixed size prevents fragmentation and the constant resize I/O. 8GB (not 4GB)
+# gives headroom for 2 MT5 terminals + 2 Python engines + RDP without OOM crashes.
+# With 4GB RAM + 8GB pagefile, the system has 12GB virtual memory total.
 $cs = Get-WmiObject -Class Win32_ComputerSystem
 $cs.AutomaticManagedPagefile = $false
 $cs.Put() | Out-Null
 
 $pf = Get-WmiObject -Class Win32_PageFileSetting
 if ($pf) {
-    $pf.InitialSize = 4096
-    $pf.MaximumSize = 4096
+    $pf.InitialSize = 8192
+    $pf.MaximumSize = 8192
     $pf.Put() | Out-Null
 } else {
     Set-WmiInstance -Class Win32_PageFileSetting -Arguments @{
         Name = "C:\pagefile.sys"
-        InitialSize = 4096
-        MaximumSize = 4096
+        InitialSize = 8192
+        MaximumSize = 8192
     } | Out-Null
 }
 

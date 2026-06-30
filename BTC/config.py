@@ -125,6 +125,15 @@ MIN_CONF_EDGE      = _env("MIN_CONF_EDGE",       8, int)
 TF_AGREE_MIN_SCORE = _env("TF_AGREE_MIN_SCORE", 22, int)
 CONF_SCALE         = _env("CONF_SCALE",       58.0, float)
 
+# Higher-timeframe context guard — filters counter-trend scalps. A higher TF (D1/H1)
+# "opposes" the signal when its OWN raw score on the other side is ≥ TF_AGREE_MIN_SCORE
+# (i.e. it would independently vote the opposite way). One opposing TF → confidence
+# ×HTF_PENALTY (re-gated vs MIN_CONFIDENCE); both D1+H1 opposing → signal vetoed.
+# Disable with HTF_GUARD_ENABLED=0. Execution-TF dominance (M15/M5/M1) is unchanged.
+HTF_GUARD_ENABLED  = _env("HTF_GUARD_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+HTF_GUARD_TFS      = ("D1", "H1")    # macro + intraday trend context for a 10-40 min trade
+HTF_PENALTY        = _env("HTF_PENALTY", 0.75, float)
+
 # ─────────────────────────────────────────────────────────────────────────
 #  SL / TP  —  Expanded for Crypto Wicks and Long Trends
 # ─────────────────────────────────────────────────────────────────────────
@@ -189,13 +198,10 @@ TRAIL_SMOOTH_BARS    = _env("TRAIL_SMOOTH_BARS", 5, int)
 
 # Time-stop: Crypto needs more time to complete a move. Extended to 90 mins.
 TIME_STOP_MIN            = _env("TIME_STOP_MIN", 90, int)
-# Minimum profit to lock in stale trade: $10.0 for BTC (instead of 10 cents)
-TIME_STOP_MIN_PROFIT_USD = _env("TIME_STOP_MIN_PROFIT_USD", 10.0, float)
+# Minimum profit (USD) the time-stop must see before it closes a stale trade.
+TIME_STOP_MIN_PROFIT_USD = _env("TIME_STOP_MIN_PROFIT_USD", 0.50, float)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  VALIDATION
-# ─────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────
 #  ORDER BLOCKS  (SMC institutional demand/supply zones — additive confluence)
 # ─────────────────────────────────────────────────────────────────────────
@@ -209,6 +215,9 @@ OB_MAX_AGE      = _env("OB_MAX_AGE", 30, int)          # bars an unmitigated zon
 OB_SCORE        = _env("OB_SCORE", 8, int)             # confluence bonus added to SMC (capped)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+#  VALIDATION
+# ─────────────────────────────────────────────────────────────────────────
 def validate():
     """Return (errors, warnings). Errors block startup; warnings degrade gracefully."""
     errors, warnings = [], []

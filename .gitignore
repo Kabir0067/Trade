@@ -6,8 +6,21 @@ __pycache__/
 Logs/
 *.log
 
+# Runtime caches / state (regenerated at run time, never committed)
+news_cache_*.json
+news_cache_btc.json
+news_cache_gold.json
+
+# Generated launcher (written by runserver.py at runtime)
+*.bat
+runserver_start.bat
+
 # Virtual environments
 .venv/
 
+# Bundled broker installer (host externally, not in git)
+_mt5_isolation/exness5setup.exe
+
 # Secrets
 .env
+

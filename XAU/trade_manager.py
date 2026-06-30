@@ -113,7 +113,8 @@ def partial_close(ticket, pct):
     if si is None or tick is None:
         return {"ok": False, "error": "no symbol/tick info"}
     step = si.volume_step if (si.volume_step and si.volume_step > 0) else 0.01
-    vmin = si.volume_min
+    # Safe fallback: a broker returning volume_min as 0/None must not break max()
+    vmin = si.volume_min if (si.volume_min and si.volume_min > 0) else 0.01
 
     # when volume_step doesn't divide evenly into the requested volume.
     raw = p.volume * pct / 100.0
@@ -124,7 +125,9 @@ def partial_close(ticket, pct):
     vol = max(vmin, vol)
     if vol <= 0:                                # floor reduced it to zero
         return {"ok": False, "error": "volume too small after rounding"}
-    if p.volume - vol < vmin:                    # can't leave a tradable remainder -> skip
+    # can't leave a sub-minimum tradable remainder (but a full close, remainder==0, is fine)
+    remainder = round(p.volume - vol, vol_digits)
+    if remainder < vmin and remainder > 0:
         return {"ok": False, "error": "remainder too small"}
 
     ctype = mt5.ORDER_TYPE_SELL if p.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
@@ -210,7 +213,9 @@ def manage_positions(symbol=None):
                 improves = be > p.sl
             else:
                 be = st["entry"] - buf - spread_buffer   # spread-aware BE
-                improves = p.sl > 0 and be < p.sl
+                # symmetric with BUY: also install BE on a SELL that has NO stop
+                # (p.sl == 0), instead of leaving it unprotected at break-even
+                improves = (p.sl <= 0) or (be < p.sl)
             if improves and modify_sl(p.ticket, be):
                 st["be_done"] = True
                 dirty = True

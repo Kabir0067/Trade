@@ -5,6 +5,7 @@
 """
 
 import sys
+import os
 import math
 import time
 import threading
@@ -32,6 +33,7 @@ bot = None
 _last_signal_time = 0.0
 _stale_since = 0.0                 # wall-clock when the feed first went stale (0 = fresh)
 _state_lock = threading.Lock()
+_isolation_ok = True              # set False under the master if the terminal-pin shim didn't engage
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -178,7 +180,7 @@ def send_signal_to_admin(s):
 #  24/7 ANALYSIS LOOP
 # ───────────────────────────────────────────────────────────────────────────
 def background_analysis_loop():
-    global _last_signal_time, _stale_since
+    global _last_signal_time, _stale_since, _isolation_ok
     print("🤖 Bitcoin Signal Bot — 24/7 Crypto institutional analysis...")
 
     engine = MultiTimeframeSignalEngine(
@@ -194,13 +196,22 @@ def background_analysis_loop():
 
             rep = mc.isolation_report()        # one-time: prove which terminal/account we bound to
             if rep:
+                # Under the master (BOT_MT5_TERMINAL set) a failed check means the
+                # terminal-pin shim did NOT engage — both bots may share ONE terminal/
+                # account. That is unsafe, so STOP trading (the order handlers check
+                # _isolation_ok) until it's fixed. A standalone run only warns.
+                if not rep.get("isolation_ok") and os.environ.get("BOT_MT5_TERMINAL"):
+                    _isolation_ok = False
+                iso_txt = ("OK ✅" if rep.get("isolation_ok")
+                           else ("НАРУШЕНА ⛔ торговля остановлена" if not _isolation_ok
+                                 else "ПРОВЕРЬ ⚠️"))
                 try:
                     bot.send_message(
                         config.TG_ADMIN_CHAT_ID,
                         f"🔗 *{config.SYMBOL}* запущен\n"
                         f"Терминал: `{rep.get('terminal')}`\n"
                         f"Счёт: `{rep.get('login')}@{rep.get('server')}`\n"
-                        f"Изоляция: {'OK ✅' if rep.get('isolation_ok') else 'ПРОВЕРЬ ⚠️'}",
+                        f"Изоляция: {iso_txt}",
                         parse_mode="Markdown")
                 except Exception:
                     pass
@@ -342,6 +353,12 @@ def _clear_buttons(call):
 
 
 def handle_trade_execution(call):
+    if not _isolation_ok:
+        try:
+            bot.answer_callback_query(call.id, "⛔ Изоляция терминала нарушена — торговля остановлена.", show_alert=True)
+        except Exception:
+            pass
+        return
     # ONE order per signal message — claim it BEFORE doing anything (shared with the
     # ⚡ buttons via _open_guard, so a signal opens exactly one order whichever button
     # you tap). Released on failure (finally) and buttons cleared only on SUCCESS, so
@@ -551,6 +568,12 @@ def send_sell_menu(message):
 
 def handle_instant_open(call):
     """Tap a fast-order button -> open a market order INSTANTLY, no SL/TP."""
+    if not _isolation_ok:
+        try:
+            bot.answer_callback_query(call.id, "⛔ Изоляция терминала нарушена — торговля остановлена.", show_alert=True)
+        except Exception:
+            pass
+        return
     # ONE order per button message — claim it BEFORE doing anything. Released on
     # failure (finally) so a failed tap doesn't dead-lock the buttons; buttons are
     # only cleared on SUCCESS, so a rejected open can still be retried.
